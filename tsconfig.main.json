@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "outDir": "./dist",
+    "noEmit": false,
+    "target": "ES2020",
+    "moduleResolution": "node"
+  },
+  "include": ["src/main/**/*"],
+  "exclude": ["node_modules", "src/renderer"]
+}
