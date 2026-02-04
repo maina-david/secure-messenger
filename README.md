@@ -33,7 +33,7 @@ A desktop messenger application built with Electron, React, and TypeScript, focu
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/maina-david/secure-messenger.git
 cd secure-messenger
 
 # Install dependencies (this will automatically rebuild native modules)
@@ -64,7 +64,6 @@ npm run watch
 1. Click the **"Seed Database"** button in the header to generate test data
    - Creates 200 chats
    - Generates 20,000+ messages distributed across chats
-   - This can only be done once (button will be disabled after seeding)
 
 2. The WebSocket connection will automatically establish and show status in the connection indicator
 
