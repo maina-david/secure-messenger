@@ -7,9 +7,12 @@ import { securityService } from './security';
 import { FileStorageService } from './fileStorageService';
 import { SchedulerService } from './schedulerService';
 import { TranslationService } from './translationService';
+import { rateLimitService } from './services/RateLimitService';
+import { createServices, Services } from './services';
 
 let mainWindow: BrowserWindow | null = null;
 let db: DatabaseService;
+let services: Services;
 let wsServer: MessengerWebSocketServer;
 let fileStorage: FileStorageService;
 let scheduler: SchedulerService;
@@ -43,12 +46,15 @@ async function initializeServices() {
   await securityService.initialize();
 
   db = new DatabaseService();
-  wsServer = new MessengerWebSocketServer(WS_PORT, db);
+  services = createServices(); // Initialize service layer
+  wsServer = new MessengerWebSocketServer(WS_PORT, services);
   wsServer.start();
   fileStorage = new FileStorageService();
-  scheduler = new SchedulerService(db, wsServer);
+  scheduler = new SchedulerService(services, wsServer);
   scheduler.start();
   translationService = new TranslationService(db, 'mock');
+
+  rateLimitService.startCleanupInterval();
 
   console.log('Services initialized');
 }
@@ -69,6 +75,7 @@ app.on('window-all-closed', () => {
     scheduler.stop();
     wsServer.close();
     db.close();
+    securityService.clearMasterKey(); // Clear keys from memory on quit
     app.quit();
   }
 });
@@ -77,11 +84,12 @@ app.on('before-quit', () => {
   scheduler.stop();
   wsServer.close();
   db.close();
+  securityService.clearMasterKey(); // Clear keys from memory before quit
 });
 
 ipcMain.handle('get-chats', async (event, limit: number, offset: number) => {
   try {
-    const chats = db.getChatList(limit, offset);
+    const chats = services.chats.getChatList(limit, offset);
     return { success: true, data: chats };
   } catch (error) {
     console.error('Error getting chats:', error);
@@ -89,61 +97,63 @@ ipcMain.handle('get-chats', async (event, limit: number, offset: number) => {
   }
 });
 
-ipcMain.handle('get-messages', async (event, chatId: number, limit: number, offset: number) => {
+ipcMain.handle('get-messages', async (event, chatId: number, limit: number = 50, offset: number = 0) => {
   try {
-    const messages = db.getMessages(chatId, limit, offset);
-
-    // Decrypt message bodies
-    const decryptedMessages = messages.map(msg => {
-      try {
-        return {
-          ...msg,
-          body: securityService.isEncrypted(msg.body) ? securityService.decrypt(msg.body) : msg.body
-        };
-      } catch (error) {
-        console.error('[Decryption] Failed to decrypt message:', msg.id);
-        return { ...msg, body: '[Decryption failed]' };
-      }
-    });
-
-    return { success: true, data: decryptedMessages };
+    const messages = await services.messages.getMessages(chatId, limit, offset);
+    return { success: true, data: messages };
   } catch (error) {
     console.error('Error getting messages:', error);
     return { success: false, error: 'Failed to get messages' };
   }
 });
 
+ipcMain.handle('get-messages-before', async (event, chatId: number, timestamp: number, limit: number = 50) => {
+  try {
+    const messages = await services.messages.getMessagesBefore(chatId, timestamp, limit);
+    return { success: true, data: messages };
+  } catch (error) {
+    console.error('Error getting messages before timestamp:', error);
+    return { success: false, error: 'Failed to get messages' };
+  }
+});
+
+ipcMain.handle('get-messages-after', async (event, chatId: number, timestamp: number, limit: number = 100) => {
+  try {
+    const messages = await services.messages.getMessagesAfter(chatId, timestamp, limit);
+    return { success: true, data: messages };
+  } catch (error) {
+    console.error('Error getting messages after timestamp:', error);
+    return { success: false, error: 'Failed to get messages' };
+  }
+});
+
+ipcMain.handle('get-last-messages-batch', async (event, chatIds: number[]) => {
+  try {
+    const messagesMap = await services.messages.getLastMessagesBatch(chatIds);
+    const result: Record<number, any> = {};
+    messagesMap.forEach((message, chatId) => {
+      result[chatId] = message;
+    });
+    return { success: true, data: result };
+  } catch (error) {
+    console.error('Error getting last messages batch:', error);
+    return { success: false, error: 'Failed to get last messages' };
+  }
+});
+
 ipcMain.handle('search-messages', async (event, chatId: number, query: string, limit: number = 50) => {
   try {
-    // NOTE: Searching encrypted messages is complex
-    // This implementation searches the encrypted text, which won't work as expected
-    // For production: implement client-side search on decrypted messages
-    // or use a separate searchable index with tokenized/hashed terms
-    const messages = db.searchMessages(chatId, query, limit);
-
-    // Decrypt message bodies
-    const decryptedMessages = messages.map(msg => {
-      try {
-        return {
-          ...msg,
-          body: securityService.isEncrypted(msg.body) ? securityService.decrypt(msg.body) : msg.body
-        };
-      } catch (error) {
-        console.error('[Decryption] Failed to decrypt message:', msg.id);
-        return { ...msg, body: '[Decryption failed]' };
-      }
-    });
-
-    return { success: true, data: decryptedMessages };
+    const messages = await services.messages.searchMessages(query, limit);
+    return { success: true, data: messages };
   } catch (error) {
     console.error('Error searching messages:', error);
     return { success: false, error: 'Failed to search messages' };
   }
 });
 
-ipcMain.handle('mark-chat-read', async (event, chatId: number) => {
+ipcMain.handle('mark-chat-read', async (event, chatId: number, userId: string) => {
   try {
-    db.markChatAsRead(chatId);
+    services.messages.markChatAsRead(chatId, userId);
     return { success: true };
   } catch (error) {
     console.error('Error marking chat as read:', error);
@@ -153,18 +163,10 @@ ipcMain.handle('mark-chat-read', async (event, chatId: number) => {
 
 ipcMain.handle('send-message', async (event, chatId: number, sender: string, body: string) => {
   try {
-    // Encrypt message body before storing
-    const encryptedBody = securityService.encrypt(body);
-
-    const timestamp = Date.now();
-    const messageId = db.createMessage(chatId, timestamp, sender, encryptedBody);
-
-    // Return plaintext message to sender (they typed it)
-    const message = { id: messageId, chatId, ts: timestamp, sender, body };
+    const message = await services.messages.sendMessage({ chatId, sender, body });
 
     if (wsServer) {
-      // Broadcast encrypted message to other clients
-      wsServer.broadcastNewMessage({ ...message, body: encryptedBody });
+      wsServer.broadcastNewMessage(message);
     }
 
     return { success: true, data: message };
@@ -176,25 +178,13 @@ ipcMain.handle('send-message', async (event, chatId: number, sender: string, bod
 
 ipcMain.handle('edit-message', async (event, messageId: number, newBody: string) => {
   try {
-    // Encrypt the new message body
-    const encryptedBody = securityService.encrypt(newBody);
-
-    const success = db.editMessage(messageId, encryptedBody);
-    if (success) {
-      const message = db.getMessageById(messageId);
-      if (wsServer && message) {
-        // Broadcast encrypted message
-        wsServer.broadcastMessageEdited(message);
-      }
-
-      // Decrypt message for return to client
-      if (message) {
-        message.body = securityService.decrypt(message.body);
-      }
-
-      return { success: true, data: message };
+    const success = await services.messages.editMessage(messageId, newBody);
+    if (success && wsServer) {
+      wsServer.broadcastMessageEdited({ id: messageId, body: newBody });
     }
-    return { success: false, error: 'Message not found or already deleted' };
+    return success
+      ? { success: true, data: { id: messageId, body: newBody } }
+      : { success: false, error: 'Message not found or already deleted' };
   } catch (error) {
     console.error('Error editing message:', error);
     return { success: false, error: 'Failed to edit message' };
@@ -203,14 +193,13 @@ ipcMain.handle('edit-message', async (event, messageId: number, newBody: string)
 
 ipcMain.handle('delete-message', async (event, messageId: number) => {
   try {
-    const success = db.deleteMessage(messageId);
-    if (success) {
-      if (wsServer) {
-        wsServer.broadcastMessageDeleted(messageId);
-      }
-      return { success: true };
+    const success = await services.messages.deleteMessage(messageId);
+    if (success && wsServer) {
+      wsServer.broadcastMessageDeleted(messageId);
     }
-    return { success: false, error: 'Message not found' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'Message not found' };
   } catch (error) {
     console.error('Error deleting message:', error);
     return { success: false, error: 'Failed to delete message' };
@@ -219,14 +208,13 @@ ipcMain.handle('delete-message', async (event, messageId: number) => {
 
 ipcMain.handle('add-reaction', async (event, messageId: number, chatId: number, userId: string, emoji: string) => {
   try {
-    const reactionId = db.addReaction(messageId, chatId, userId, emoji);
-    if (reactionId) {
-      if (wsServer) {
-        wsServer.broadcastReactionAdded(messageId, chatId, userId, emoji);
-      }
-      return { success: true, data: { id: reactionId, messageId, chatId, userId, emoji, createdAt: Date.now() } };
+    const success = services.messages.addReaction(messageId, chatId, userId, emoji);
+    if (success && wsServer) {
+      wsServer.broadcastReactionAdded(messageId, chatId, userId, emoji);
     }
-    return { success: false, error: 'Reaction already exists' };
+    return success
+      ? { success: true, data: { messageId, chatId, userId, emoji, createdAt: Date.now() } }
+      : { success: false, error: 'Reaction already exists' };
   } catch (error) {
     console.error('Error adding reaction:', error);
     return { success: false, error: 'Failed to add reaction' };
@@ -235,14 +223,13 @@ ipcMain.handle('add-reaction', async (event, messageId: number, chatId: number, 
 
 ipcMain.handle('remove-reaction', async (event, messageId: number, userId: string, emoji: string) => {
   try {
-    const success = db.removeReaction(messageId, userId, emoji);
-    if (success) {
-      if (wsServer) {
-        wsServer.broadcastReactionRemoved(messageId, userId, emoji);
-      }
-      return { success: true };
+    const success = services.messages.removeReaction(messageId, userId, emoji);
+    if (success && wsServer) {
+      wsServer.broadcastReactionRemoved(messageId, userId, emoji);
     }
-    return { success: false, error: 'Reaction not found' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'Reaction not found' };
   } catch (error) {
     console.error('Error removing reaction:', error);
     return { success: false, error: 'Failed to remove reaction' };
@@ -251,7 +238,7 @@ ipcMain.handle('remove-reaction', async (event, messageId: number, userId: strin
 
 ipcMain.handle('get-reactions', async (event, messageId: number) => {
   try {
-    const reactions = db.getReactions(messageId);
+    const reactions = services.messages.getReactions(messageId);
     return { success: true, data: reactions };
   } catch (error) {
     console.error('Error getting reactions:', error);
@@ -261,7 +248,7 @@ ipcMain.handle('get-reactions', async (event, messageId: number) => {
 
 ipcMain.handle('get-reactions-by-chat', async (event, chatId: number) => {
   try {
-    const reactions = db.getReactionsByChat(chatId);
+    const reactions = services.messages.getReactionsByChat(chatId);
     return { success: true, data: reactions };
   } catch (error) {
     console.error('Error getting reactions by chat:', error);
@@ -271,14 +258,13 @@ ipcMain.handle('get-reactions-by-chat', async (event, chatId: number) => {
 
 ipcMain.handle('mark-message-read', async (event, messageId: number, userId: string) => {
   try {
-    const success = db.markMessageAsRead(messageId, userId);
-    if (success) {
-      if (wsServer) {
-        wsServer.broadcastMessageRead(messageId, userId);
-      }
-      return { success: true };
+    const success = services.messages.markAsRead(messageId, userId);
+    if (success && wsServer) {
+      wsServer.broadcastMessageRead(messageId, userId);
     }
-    return { success: false, error: 'Failed to mark message as read' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'Failed to mark message as read' };
   } catch (error) {
     console.error('Error marking message as read:', error);
     return { success: false, error: 'Failed to mark message as read' };
@@ -287,7 +273,7 @@ ipcMain.handle('mark-message-read', async (event, messageId: number, userId: str
 
 ipcMain.handle('get-read-receipts', async (event, messageId: number) => {
   try {
-    const receipts = db.getReadReceipts(messageId);
+    const receipts = services.messages.getReadReceipts(messageId);
     return { success: true, data: receipts };
   } catch (error) {
     console.error('Error getting read receipts:', error);
@@ -297,7 +283,7 @@ ipcMain.handle('get-read-receipts', async (event, messageId: number) => {
 
 ipcMain.handle('get-read-receipts-by-chat', async (event, chatId: number) => {
   try {
-    const receipts = db.getReadReceiptsByChat(chatId);
+    const receipts = services.messages.getReadReceiptsByChat(chatId);
     return { success: true, data: receipts };
   } catch (error) {
     console.error('Error getting read receipts by chat:', error);
@@ -307,8 +293,7 @@ ipcMain.handle('get-read-receipts-by-chat', async (event, chatId: number) => {
 
 ipcMain.handle('mark-message-delivered', async (event, messageId: number) => {
   try {
-    db.markMessageDelivered(messageId);
-    // Broadcast delivery confirmation via WebSocket
+    services.messages.markMessageDelivered(messageId);
     if (wsServer) {
       wsServer.broadcastMessageDelivered(messageId);
     }
@@ -321,7 +306,7 @@ ipcMain.handle('mark-message-delivered', async (event, messageId: number) => {
 
 ipcMain.handle('get-delivery-status', async (event, messageId: number) => {
   try {
-    const status = db.getDeliveryStatus(messageId);
+    const status = services.messages.getDeliveryStatus(messageId);
     return { success: true, data: status };
   } catch (error) {
     console.error('Error getting delivery status:', error);
@@ -331,7 +316,7 @@ ipcMain.handle('get-delivery-status', async (event, messageId: number) => {
 
 ipcMain.handle('save-draft', async (event, chatId: number, content: string) => {
   try {
-    db.saveDraft(chatId, content);
+    services.chats.saveDraft(chatId, content);
     return { success: true };
   } catch (error) {
     console.error('Error saving draft:', error);
@@ -341,7 +326,7 @@ ipcMain.handle('save-draft', async (event, chatId: number, content: string) => {
 
 ipcMain.handle('get-draft', async (event, chatId: number) => {
   try {
-    const draft = db.getDraft(chatId);
+    const draft = services.chats.getDraft(chatId);
     return { success: true, data: draft };
   } catch (error) {
     console.error('Error getting draft:', error);
@@ -351,7 +336,7 @@ ipcMain.handle('get-draft', async (event, chatId: number) => {
 
 ipcMain.handle('delete-draft', async (event, chatId: number) => {
   try {
-    db.deleteDraft(chatId);
+    services.chats.deleteDraft(chatId);
     return { success: true };
   } catch (error) {
     console.error('Error deleting draft:', error);
@@ -361,7 +346,7 @@ ipcMain.handle('delete-draft', async (event, chatId: number) => {
 
 ipcMain.handle('search-all-messages', async (event, query: string, limit: number) => {
   try {
-    const messages = db.searchMessagesAllChats(query, limit);
+    const messages = await services.messages.searchMessagesAllChats(query, limit);
     return { success: true, data: messages };
   } catch (error) {
     console.error('Error searching all messages:', error);
@@ -371,11 +356,10 @@ ipcMain.handle('search-all-messages', async (event, query: string, limit: number
 
 ipcMain.handle('set-message-reply', async (event, messageId: number, replyToMessageId: number) => {
   try {
-    const success = db.setMessageReply(messageId, replyToMessageId);
-    if (success) {
-      return { success: true };
-    }
-    return { success: false, error: 'Failed to set message reply' };
+    const success = services.messages.setMessageReply(messageId, replyToMessageId);
+    return success
+      ? { success: true }
+      : { success: false, error: 'Failed to set message reply' };
   } catch (error) {
     console.error('Error setting message reply:', error);
     return { success: false, error: 'Failed to set message reply' };
@@ -384,7 +368,7 @@ ipcMain.handle('set-message-reply', async (event, messageId: number, replyToMess
 
 ipcMain.handle('get-message-reply', async (event, messageId: number) => {
   try {
-    const replyToMessageId = db.getMessageReply(messageId);
+    const replyToMessageId = services.messages.getMessageReply(messageId);
     return { success: true, data: replyToMessageId };
   } catch (error) {
     console.error('Error getting message reply:', error);
@@ -394,7 +378,7 @@ ipcMain.handle('get-message-reply', async (event, messageId: number) => {
 
 ipcMain.handle('get-replies-to', async (event, messageId: number) => {
   try {
-    const replies = db.getRepliesTo(messageId);
+    const replies = await services.messages.getRepliesTo(messageId);
     return { success: true, data: replies };
   } catch (error) {
     console.error('Error getting replies:', error);
@@ -404,11 +388,10 @@ ipcMain.handle('get-replies-to', async (event, messageId: number) => {
 
 ipcMain.handle('delete-message-reply', async (event, messageId: number) => {
   try {
-    const success = db.deleteMessageReply(messageId);
-    if (success) {
-      return { success: true };
-    }
-    return { success: false, error: 'Reply not found' };
+    const success = services.messages.deleteMessageReply(messageId);
+    return success
+      ? { success: true }
+      : { success: false, error: 'Reply not found' };
   } catch (error) {
     console.error('Error deleting message reply:', error);
     return { success: false, error: 'Failed to delete message reply' };
@@ -417,14 +400,13 @@ ipcMain.handle('delete-message-reply', async (event, messageId: number) => {
 
 ipcMain.handle('pin-message', async (event, messageId: number, chatId: number, pinnedBy: string) => {
   try {
-    const pinnedId = db.pinMessage(messageId, chatId, pinnedBy);
-    if (pinnedId) {
-      if (wsServer) {
-        wsServer.broadcastMessagePinned(messageId, chatId);
-      }
-      return { success: true, data: { id: pinnedId, messageId, chatId, pinnedBy, pinnedAt: Date.now() } };
+    const pinnedId = services.messages.pinMessage(messageId, chatId, pinnedBy);
+    if (pinnedId && wsServer) {
+      wsServer.broadcastMessagePinned(messageId, chatId);
     }
-    return { success: false, error: 'Message already pinned' };
+    return pinnedId
+      ? { success: true, data: { id: pinnedId, messageId, chatId, pinnedBy, pinnedAt: Date.now() } }
+      : { success: false, error: 'Message already pinned' };
   } catch (error) {
     console.error('Error pinning message:', error);
     return { success: false, error: 'Failed to pin message' };
@@ -433,14 +415,13 @@ ipcMain.handle('pin-message', async (event, messageId: number, chatId: number, p
 
 ipcMain.handle('unpin-message', async (event, messageId: number, chatId: number) => {
   try {
-    const success = db.unpinMessage(messageId, chatId);
-    if (success) {
-      if (wsServer) {
-        wsServer.broadcastMessageUnpinned(messageId, chatId);
-      }
-      return { success: true };
+    const success = services.messages.unpinMessage(messageId, chatId);
+    if (success && wsServer) {
+      wsServer.broadcastMessageUnpinned(messageId, chatId);
     }
-    return { success: false, error: 'Pinned message not found' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'Pinned message not found' };
   } catch (error) {
     console.error('Error unpinning message:', error);
     return { success: false, error: 'Failed to unpin message' };
@@ -449,7 +430,7 @@ ipcMain.handle('unpin-message', async (event, messageId: number, chatId: number)
 
 ipcMain.handle('get-pinned-messages', async (event, chatId: number) => {
   try {
-    const pinnedMessages = db.getPinnedMessages(chatId);
+    const pinnedMessages = services.messages.getPinnedMessages(chatId);
     return { success: true, data: pinnedMessages };
   } catch (error) {
     console.error('Error getting pinned messages:', error);
@@ -459,7 +440,7 @@ ipcMain.handle('get-pinned-messages', async (event, chatId: number) => {
 
 ipcMain.handle('is-pinned', async (event, messageId: number, chatId: number) => {
   try {
-    const isPinned = db.isPinned(messageId, chatId);
+    const isPinned = services.messages.isPinned(messageId, chatId);
     return { success: true, data: isPinned };
   } catch (error) {
     console.error('Error checking if message is pinned:', error);
@@ -469,8 +450,8 @@ ipcMain.handle('is-pinned', async (event, messageId: number, chatId: number) => 
 
 ipcMain.handle('export-messages', async (event, chatId: number, format: 'txt' | 'json' | 'html') => {
   try {
-    const messages = db.getMessages(chatId, 10000, 0);
-    const chat = db.getChatById(chatId);
+    const messages = await services.messages.getMessages(chatId, 10000, 0);
+    const chat = services.chats.getChat(chatId);
 
     if (!chat) {
       return { success: false, error: 'Chat not found' };
@@ -652,11 +633,9 @@ function formatAsHtml(messages: any[], chatTitle: string): string {
   return html;
 }
 
-// Presence operations
 ipcMain.handle('update-presence', async (event, userId: string, status: 'online' | 'offline' | 'away') => {
   try {
-    db.updatePresence(userId, status);
-    // Broadcast presence change to all clients
+    services.presence.updatePresence(userId, status);
     if (wsServer) {
       wsServer.broadcastPresenceChanged(userId, status, Date.now());
     }
@@ -669,7 +648,7 @@ ipcMain.handle('update-presence', async (event, userId: string, status: 'online'
 
 ipcMain.handle('get-user-presence', async (event, userId: string) => {
   try {
-    const presence = db.getUserPresence(userId);
+    const presence = services.presence.getUserPresence(userId);
     return { success: true, data: presence };
   } catch (error) {
     console.error('Error getting user presence:', error);
@@ -679,7 +658,7 @@ ipcMain.handle('get-user-presence', async (event, userId: string) => {
 
 ipcMain.handle('get-all-presence', async () => {
   try {
-    const presence = db.getAllPresence();
+    const presence = services.presence.getAllPresence();
     return { success: true, data: presence };
   } catch (error) {
     console.error('Error getting all presence:', error);
@@ -687,10 +666,9 @@ ipcMain.handle('get-all-presence', async () => {
   }
 });
 
-// Mention operations
 ipcMain.handle('add-mention', async (event, messageId: number, mentionedUserId: string) => {
   try {
-    const mentionId = db.addMention(messageId, mentionedUserId);
+    const mentionId = services.mentions.addMention(messageId, mentionedUserId);
     return { success: true, data: { id: mentionId, messageId, mentionedUserId } };
   } catch (error) {
     console.error('Error adding mention:', error);
@@ -700,7 +678,7 @@ ipcMain.handle('add-mention', async (event, messageId: number, mentionedUserId: 
 
 ipcMain.handle('get-mentions-by-message', async (event, messageId: number) => {
   try {
-    const mentions = db.getMentionsByMessage(messageId);
+    const mentions = services.mentions.getMentionsByMessage(messageId);
     return { success: true, data: mentions };
   } catch (error) {
     console.error('Error getting mentions by message:', error);
@@ -710,7 +688,7 @@ ipcMain.handle('get-mentions-by-message', async (event, messageId: number) => {
 
 ipcMain.handle('get-mentions-by-user', async (event, userId: string, limit: number) => {
   try {
-    const messages = db.getMentionsByUser(userId, limit);
+    const messages = services.mentions.getMentionsByUser(userId, limit);
     return { success: true, data: messages };
   } catch (error) {
     console.error('Error getting mentions by user:', error);
@@ -718,17 +696,14 @@ ipcMain.handle('get-mentions-by-user', async (event, userId: string, limit: numb
   }
 });
 
-// Message forwarding operations
 ipcMain.handle('forward-message', async (event, originalMessageId: number, targetChatId: number, sender: string) => {
   try {
-    const newMessageId = db.forwardMessage(originalMessageId, targetChatId, sender);
-    if (!newMessageId) {
+    const newMessage = await services.messages.forwardMessage(originalMessageId, targetChatId, sender);
+    if (!newMessage) {
       return { success: false, error: 'Failed to forward message (message may not exist or is deleted)' };
     }
 
-    const newMessage = db.getMessageById(newMessageId);
-    if (newMessage && wsServer) {
-      // Broadcast the forwarded message
+    if (wsServer) {
       wsServer.broadcastMessageForwarded({
         id: newMessage.id,
         chatId: newMessage.chatId,
@@ -746,10 +721,9 @@ ipcMain.handle('forward-message', async (event, originalMessageId: number, targe
   }
 });
 
-// Disappearing messages operations
 ipcMain.handle('set-disappearing-timeout', async (event, chatId: number, timeout: number | null) => {
   try {
-    const success = db.setDisappearingTimeout(chatId, timeout);
+    const success = services.chats.setDisappearingTimeout(chatId, timeout);
     if (success) {
       return { success: true };
     }
@@ -762,7 +736,7 @@ ipcMain.handle('set-disappearing-timeout', async (event, chatId: number, timeout
 
 ipcMain.handle('get-disappearing-timeout', async (event, chatId: number) => {
   try {
-    const timeout = db.getDisappearingTimeout(chatId);
+    const timeout = services.chats.getDisappearingTimeout(chatId);
     return { success: true, data: timeout };
   } catch (error) {
     console.error('Error getting disappearing timeout:', error);
@@ -772,13 +746,10 @@ ipcMain.handle('get-disappearing-timeout', async (event, chatId: number) => {
 
 ipcMain.handle('cleanup-expired-messages', async () => {
   try {
-    // Get expired messages before deletion to broadcast events
-    const expiredMessages = db.getExpiredMessages();
+    const expiredMessages = await services.messages.getExpiredMessages();
 
-    // Delete expired messages
-    const deletedCount = db.cleanupExpiredMessages();
+    const deletedCount = services.messages.cleanupExpiredMessages();
 
-    // Broadcast deletion events to all clients
     if (wsServer) {
       for (const msg of expiredMessages) {
         wsServer.broadcastMessageDeleted(msg.id);
@@ -792,7 +763,6 @@ ipcMain.handle('cleanup-expired-messages', async () => {
   }
 });
 
-// Advanced search operations
 ipcMain.handle('search-messages-advanced', async (event, options: {
   query: string;
   chatId?: number;
@@ -802,7 +772,7 @@ ipcMain.handle('search-messages-advanced', async (event, options: {
   limit?: number;
 }) => {
   try {
-    const messages = db.searchMessagesAdvanced(options);
+    const messages = await services.messages.searchMessagesAdvanced(options);
     return { success: true, data: messages };
   } catch (error) {
     console.error('Error performing advanced search:', error);
@@ -812,7 +782,7 @@ ipcMain.handle('search-messages-advanced', async (event, options: {
 
 ipcMain.handle('get-all-senders', async () => {
   try {
-    const senders = db.getAllSenders();
+    const senders = services.messages.getAllSenders();
     return { success: true, data: senders };
   } catch (error) {
     console.error('Error getting senders:', error);
@@ -820,14 +790,10 @@ ipcMain.handle('get-all-senders', async () => {
   }
 });
 
-// ===========================
-// User Settings Handlers
-// ===========================
 
-// Get user setting
 ipcMain.handle('get-user-setting', async (event, key: string) => {
   try {
-    const setting = db.getUserSetting(key);
+    const setting = services.settings.getUserSetting(key);
     return { success: true, data: setting };
   } catch (error) {
     console.error('Error getting user setting:', error);
@@ -835,10 +801,9 @@ ipcMain.handle('get-user-setting', async (event, key: string) => {
   }
 });
 
-// Set user setting
 ipcMain.handle('set-user-setting', async (event, key: string, value: string) => {
   try {
-    db.setUserSetting(key, value);
+    services.settings.setUserSetting(key, value);
     return { success: true };
   } catch (error) {
     console.error('Error setting user setting:', error);
@@ -846,10 +811,9 @@ ipcMain.handle('set-user-setting', async (event, key: string, value: string) => 
   }
 });
 
-// Delete user setting
 ipcMain.handle('delete-user-setting', async (event, key: string) => {
   try {
-    const deleted = db.deleteUserSetting(key);
+    const deleted = services.settings.deleteUserSetting(key);
     return { success: true, data: deleted };
   } catch (error) {
     console.error('Error deleting user setting:', error);
@@ -857,10 +821,9 @@ ipcMain.handle('delete-user-setting', async (event, key: string) => {
   }
 });
 
-// Get all settings
 ipcMain.handle('get-all-settings', async () => {
   try {
-    const settings = db.getAllSettings();
+    const settings = services.settings.getAllSettings();
     return { success: true, data: settings };
   } catch (error) {
     console.error('Error getting all settings:', error);
@@ -868,14 +831,10 @@ ipcMain.handle('get-all-settings', async () => {
   }
 });
 
-// ===========================
-// Keyboard Shortcuts Handlers
-// ===========================
 
-// Get keyboard shortcuts
 ipcMain.handle('get-keyboard-shortcuts', async () => {
   try {
-    const shortcuts = db.getKeyboardShortcuts();
+    const shortcuts = services.settings.getKeyboardShortcuts();
     return { success: true, data: shortcuts };
   } catch (error) {
     console.error('Error getting keyboard shortcuts:', error);
@@ -883,10 +842,9 @@ ipcMain.handle('get-keyboard-shortcuts', async () => {
   }
 });
 
-// Set keyboard shortcuts
 ipcMain.handle('set-keyboard-shortcuts', async (event, shortcuts) => {
   try {
-    db.setKeyboardShortcuts(shortcuts);
+    services.settings.setKeyboardShortcuts(shortcuts);
     return { success: true };
   } catch (error) {
     console.error('Error setting keyboard shortcuts:', error);
@@ -894,10 +852,9 @@ ipcMain.handle('set-keyboard-shortcuts', async (event, shortcuts) => {
   }
 });
 
-// Reset keyboard shortcuts to defaults
 ipcMain.handle('reset-keyboard-shortcuts', async () => {
   try {
-    const shortcuts = db.resetKeyboardShortcuts();
+    const shortcuts = services.settings.resetKeyboardShortcuts();
     return { success: true, data: shortcuts };
   } catch (error) {
     console.error('Error resetting keyboard shortcuts:', error);
@@ -905,14 +862,10 @@ ipcMain.handle('reset-keyboard-shortcuts', async () => {
   }
 });
 
-// ===========================
-// Notification Settings Handlers
-// ===========================
 
-// Get notification sound
 ipcMain.handle('get-notification-sound', async (event, chatId?: number) => {
   try {
-    const soundId = db.getNotificationSound(chatId);
+    const soundId = services.settings.getNotificationSound(chatId);
     return { success: true, data: soundId };
   } catch (error) {
     console.error('Error getting notification sound:', error);
@@ -920,10 +873,9 @@ ipcMain.handle('get-notification-sound', async (event, chatId?: number) => {
   }
 });
 
-// Set notification sound
 ipcMain.handle('set-notification-sound', async (event, chatId: number | null, soundId: string) => {
   try {
-    db.setNotificationSound(chatId, soundId);
+    services.settings.setNotificationSound(chatId, soundId);
     return { success: true };
   } catch (error) {
     console.error('Error setting notification sound:', error);
@@ -931,10 +883,9 @@ ipcMain.handle('set-notification-sound', async (event, chatId: number | null, so
   }
 });
 
-// Delete notification sound
 ipcMain.handle('delete-notification-sound', async (event, chatId?: number) => {
   try {
-    const deleted = db.deleteNotificationSound(chatId);
+    const deleted = services.settings.deleteNotificationSound(chatId);
     return { success: true, data: deleted };
   } catch (error) {
     console.error('Error deleting notification sound:', error);
@@ -942,27 +893,21 @@ ipcMain.handle('delete-notification-sound', async (event, chatId?: number) => {
   }
 });
 
-// ===========================
-// WebRTC Calls Handlers
-// ===========================
 
-// Initiate a call
 ipcMain.handle('initiate-call', async (event, callId: string, chatId: number, callType: 'audio' | 'video', initiatedBy: string) => {
   try {
-    db.createCall(callId, chatId, callType, initiatedBy);
-    db.addCallParticipant(callId, initiatedBy);
-    wsServer.broadcastCallInitiated(callId, chatId, callType, initiatedBy);
-    return { success: true, data: callId };
+    const generatedCallId = services.calls.createCall(chatId, callType, initiatedBy);
+    wsServer.broadcastCallInitiated(generatedCallId, chatId, callType, initiatedBy);
+    return { success: true, data: generatedCallId };
   } catch (error) {
     console.error('Error initiating call:', error);
     return { success: false, error: 'Failed to initiate call' };
   }
 });
 
-// Get call details
 ipcMain.handle('get-call', async (event, callId: string) => {
   try {
-    const call = db.getCall(callId);
+    const call = services.calls.getCall(callId);
     return { success: true, data: call };
   } catch (error) {
     console.error('Error getting call:', error);
@@ -970,10 +915,9 @@ ipcMain.handle('get-call', async (event, callId: string) => {
   }
 });
 
-// Get calls by chat
 ipcMain.handle('get-calls-by-chat', async (event, chatId: number, limit: number = 50) => {
   try {
-    const calls = db.getCallsByChat(chatId, limit);
+    const calls = services.calls.getCallsByChat(chatId, limit);
     return { success: true, data: calls };
   } catch (error) {
     console.error('Error getting calls:', error);
@@ -981,10 +925,9 @@ ipcMain.handle('get-calls-by-chat', async (event, chatId: number, limit: number 
   }
 });
 
-// Get active call for a chat
 ipcMain.handle('get-active-call', async (event, chatId: number) => {
   try {
-    const call = db.getActiveCall(chatId);
+    const call = services.calls.getActiveCall(chatId);
     return { success: true, data: call };
   } catch (error) {
     console.error('Error getting active call:', error);
@@ -992,11 +935,9 @@ ipcMain.handle('get-active-call', async (event, chatId: number) => {
   }
 });
 
-// Answer call (join as participant)
 ipcMain.handle('answer-call', async (event, callId: string, userId: string) => {
   try {
-    db.updateCallStatus(callId, 'active');
-    db.addCallParticipant(callId, userId);
+    services.calls.answerCall(callId, userId);
     wsServer.broadcastParticipantJoinedCall(callId, userId);
     return { success: true };
   } catch (error) {
@@ -1005,10 +946,9 @@ ipcMain.handle('answer-call', async (event, callId: string, userId: string) => {
   }
 });
 
-// Decline call
 ipcMain.handle('decline-call', async (event, callId: string, userId: string) => {
   try {
-    db.declineCall(callId);
+    services.calls.declineCall(callId);
     wsServer.broadcastCallDeclined(callId, userId);
     return { success: true };
   } catch (error) {
@@ -1017,10 +957,9 @@ ipcMain.handle('decline-call', async (event, callId: string, userId: string) => 
   }
 });
 
-// End call
 ipcMain.handle('end-call', async (event, callId: string, userId: string) => {
   try {
-    db.endCall(callId);
+    services.calls.endCall(callId);
     wsServer.broadcastCallEnded(callId, userId);
     return { success: true };
   } catch (error) {
@@ -1029,10 +968,9 @@ ipcMain.handle('end-call', async (event, callId: string, userId: string) => {
   }
 });
 
-// Leave call (remove participant)
 ipcMain.handle('leave-call', async (event, callId: string, userId: string) => {
   try {
-    db.removeCallParticipant(callId, userId);
+    services.calls.removeCallParticipant(callId, userId);
     wsServer.broadcastParticipantLeftCall(callId, userId);
     return { success: true };
   } catch (error) {
@@ -1041,10 +979,9 @@ ipcMain.handle('leave-call', async (event, callId: string, userId: string) => {
   }
 });
 
-// Get call participants
 ipcMain.handle('get-call-participants', async (event, callId: string) => {
   try {
-    const participants = db.getCallParticipants(callId);
+    const participants = services.calls.getCallParticipants(callId);
     return { success: true, data: participants };
   } catch (error) {
     console.error('Error getting call participants:', error);
@@ -1052,10 +989,9 @@ ipcMain.handle('get-call-participants', async (event, callId: string) => {
   }
 });
 
-// Get active call participants
 ipcMain.handle('get-active-call-participants', async (event, callId: string) => {
   try {
-    const participants = db.getActiveCallParticipants(callId);
+    const participants = services.calls.getActiveCallParticipants(callId);
     return { success: true, data: participants };
   } catch (error) {
     console.error('Error getting active call participants:', error);
@@ -1063,7 +999,6 @@ ipcMain.handle('get-active-call-participants', async (event, callId: string) => 
   }
 });
 
-// WebRTC Signaling - Send offer
 ipcMain.handle('send-call-offer', async (event, callId: string, fromUserId: string, offer: string) => {
   try {
     wsServer.broadcastCallOffer(callId, fromUserId, offer);
@@ -1074,7 +1009,6 @@ ipcMain.handle('send-call-offer', async (event, callId: string, fromUserId: stri
   }
 });
 
-// WebRTC Signaling - Send answer
 ipcMain.handle('send-call-answer', async (event, callId: string, fromUserId: string, answer: string) => {
   try {
     wsServer.broadcastCallAnswer(callId, fromUserId, answer);
@@ -1085,7 +1019,6 @@ ipcMain.handle('send-call-answer', async (event, callId: string, fromUserId: str
   }
 });
 
-// WebRTC Signaling - Send ICE candidate
 ipcMain.handle('send-ice-candidate', async (event, callId: string, fromUserId: string, candidate: string) => {
   try {
     wsServer.broadcastIceCandidate(callId, fromUserId, candidate);
@@ -1096,7 +1029,6 @@ ipcMain.handle('send-ice-candidate', async (event, callId: string, fromUserId: s
   }
 });
 
-// Start screen sharing
 ipcMain.handle('start-screen-share', async (event, callId: string, userId: string) => {
   try {
     wsServer.broadcastScreenShareStarted(callId, userId);
@@ -1107,7 +1039,6 @@ ipcMain.handle('start-screen-share', async (event, callId: string, userId: strin
   }
 });
 
-// Stop screen sharing
 ipcMain.handle('stop-screen-share', async (event, callId: string, userId: string) => {
   try {
     wsServer.broadcastScreenShareStopped(callId, userId);
@@ -1118,10 +1049,107 @@ ipcMain.handle('stop-screen-share', async (event, callId: string, userId: string
   }
 });
 
-// Seed database with test data
 ipcMain.handle('seed-database', async () => {
   try {
-    db.seedData();
+    db.clearDatabase();
+    console.log('Database cleared');
+    console.log('Seeding database...');
+
+    const firstNames = [
+      'Sarah', 'Michael', 'Emily', 'David', 'Jessica', 'James', 'Ashley', 'Christopher',
+      'Amanda', 'Daniel', 'Jennifer', 'Matthew', 'Lauren', 'Andrew', 'Samantha', 'Joshua',
+      'Elizabeth', 'Ryan', 'Nicole', 'Brandon', 'Sophia', 'Jacob', 'Emma', 'William',
+      'Olivia', 'Alexander', 'Isabella', 'Ethan', 'Mia', 'Benjamin', 'Charlotte', 'Lucas',
+      'Amelia', 'Mason', 'Harper', 'Logan', 'Evelyn', 'Oliver', 'Abigail', 'Elijah'
+    ];
+
+    const lastNames = [
+      'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis',
+      'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Gonzalez', 'Wilson', 'Anderson',
+      'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Thompson', 'White',
+      'Harris', 'Clark', 'Lewis', 'Robinson', 'Walker', 'Young', 'Hall', 'Allen', 'King'
+    ];
+
+    const messageTemplates = [
+      'Hey! How are you doing?', 'Can we meet up tomorrow?', 'Thanks for your help!',
+      'Let me know what you think.', 'Great work on the project!', 'I have some news to share.',
+      'Can you help me with something?', 'See you soon!', 'That sounds great!',
+      'Let me check and get back to you.', 'Did you see the latest update?',
+      'We should catch up this weekend.', 'The meeting went really well!',
+      'I found a solution to that problem.', 'Thanks for the quick response!',
+      'Looking forward to working with you.', 'Have you finished the report?',
+      'Let me know if you need anything.', 'That deadline is coming up fast.',
+      'I appreciate your help on this.', 'Just following up on our conversation.',
+      'The client was very happy with the results.', 'Can you review this when you get a chance?',
+      'I have a few questions about the project.', 'Sounds good, let me know!',
+      'I will get that done today.', 'Perfect timing, I was just thinking about that.',
+      'We need to discuss this further.', 'Great idea! Let me look into it.',
+      'I am available anytime this week.', 'Thanks for keeping me updated.',
+      'This is exactly what we needed.', 'I will send you the details shortly.',
+      'Let me know what works for you.', 'Looking forward to your feedback.',
+      'That makes a lot of sense.', 'I will circle back on this tomorrow.',
+      'Just wanted to give you a quick update.', 'Can we schedule a call?',
+      'I have sent you the files.', 'Everything looks good on my end.'
+    ];
+
+    const chatIds: number[] = [];
+    const now = Date.now();
+
+    console.log('Creating 200 chats...');
+    for (let i = 0; i < 200; i++) {
+      const firstName = firstNames[i % firstNames.length];
+      const lastName = lastNames[Math.floor(i / firstNames.length) % lastNames.length];
+      const contactName = `${firstName} ${lastName}`;
+
+      const chatId = await services.chats.createChat({
+        title: contactName,
+        type: 'direct',
+        participantIds: [contactName, 'Me'],
+        createdBy: 'Me'
+      });
+      chatIds.push(chatId);
+
+      if ((i + 1) % 50 === 0) {
+        console.log(`Created ${i + 1} chats...`);
+      }
+    }
+
+    console.log(`Created ${chatIds.length} chats`);
+    console.log('Creating 20,000+ messages (this will take a few minutes)...');
+
+    let messageCount = 0;
+    for (let chatIndex = 0; chatIndex < chatIds.length; chatIndex++) {
+      const chatId = chatIds[chatIndex];
+      const firstName = firstNames[chatIndex % firstNames.length];
+      const lastName = lastNames[Math.floor(chatIndex / firstNames.length) % lastNames.length];
+      const contactName = `${firstName} ${lastName}`;
+
+      const messagesPerChat = 100 + Math.floor(Math.random() * 10);
+
+      for (let msgIndex = 0; msgIndex < messagesPerChat; msgIndex++) {
+        const template = messageTemplates[messageCount % messageTemplates.length];
+        const timestamp = now - (messageCount * 60000);
+        const isFromMe = msgIndex % 2 === 0;
+        const sender = isFromMe ? 'Me' : contactName;
+
+        await services.messages.sendMessage({
+          chatId,
+          sender,
+          body: template,
+          timestamp
+        });
+
+        messageCount++;
+      }
+
+      if ((chatIndex + 1) % 50 === 0) {
+        console.log(`Created ${messageCount} messages (${chatIndex + 1}/${chatIds.length} chats)...`);
+      }
+    }
+
+    console.log(`Created ${messageCount} encrypted messages`);
+    console.log('Database seeded successfully');
+
     return { success: true };
   } catch (error) {
     console.error('Error seeding database:', error);
@@ -1129,7 +1157,6 @@ ipcMain.handle('seed-database', async () => {
   }
 });
 
-// Get database stats
 ipcMain.handle('get-stats', async () => {
   try {
     const stats = db.getStats();
@@ -1140,12 +1167,10 @@ ipcMain.handle('get-stats', async () => {
   }
 });
 
-// Get WebSocket port
 ipcMain.handle('get-ws-port', async () => {
   return { success: true, data: WS_PORT };
 });
 
-// Simulate connection drop
 ipcMain.handle('simulate-disconnect', async () => {
   try {
     wsServer.disconnectAllClients();
@@ -1156,18 +1181,18 @@ ipcMain.handle('simulate-disconnect', async () => {
   }
 });
 
-// Group chat operations
 ipcMain.handle('create-group-chat', async (event, title: string, createdBy: string, participantIds: string[]) => {
   try {
-    const chatId = db.createGroupChat(title, createdBy, participantIds);
-    if (chatId) {
-      // Broadcast group chat creation to all clients
-      if (wsServer) {
-        wsServer.broadcastGroupChatCreated(chatId, title, createdBy);
-      }
-      return { success: true, data: chatId };
+    const chatId = await services.chats.createChat({
+      title,
+      type: 'group',
+      participantIds,
+      createdBy
+    });
+    if (wsServer) {
+      wsServer.broadcastGroupChatCreated(chatId, title, createdBy);
     }
-    return { success: false, error: 'Failed to create group chat' };
+    return { success: true, data: chatId };
   } catch (error) {
     console.error('Error creating group chat:', error);
     return { success: false, error: 'Failed to create group chat' };
@@ -1176,32 +1201,28 @@ ipcMain.handle('create-group-chat', async (event, title: string, createdBy: stri
 
 ipcMain.handle('add-chat-participant', async (event, chatId: number, userId: string, role: 'admin' | 'member') => {
   try {
-    const participantId = db.addChatParticipant(chatId, userId, role);
-    if (participantId) {
-      // Broadcast participant added to all clients
-      if (wsServer) {
-        wsServer.broadcastParticipantAdded(chatId, userId, role);
-      }
-      return { success: true };
+    const success = services.chats.addParticipant(chatId, userId, role);
+    if (success && wsServer) {
+      wsServer.broadcastParticipantAdded(chatId, userId, role);
     }
-    return { success: false, error: 'User is already a participant or invalid chat' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'User is already a participant or invalid chat' };
   } catch (error) {
     console.error('Error adding chat participant:', error);
     return { success: false, error: 'Failed to add participant' };
   }
 });
 
-ipcMain.handle('remove-chat-participant', async (event, chatId: number, userId: string) => {
+ipcMain.handle('remove-chat-participant', async (event, chatId: number, userId: string, removedBy: string) => {
   try {
-    const success = db.removeChatParticipant(chatId, userId);
-    if (success) {
-      // Broadcast participant removed to all clients
-      if (wsServer) {
-        wsServer.broadcastParticipantRemoved(chatId, userId);
-      }
-      return { success: true };
+    const success = services.chats.removeParticipant(chatId, userId, removedBy);
+    if (success && wsServer) {
+      wsServer.broadcastParticipantRemoved(chatId, userId);
     }
-    return { success: false, error: 'Participant not found' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'Participant not found' };
   } catch (error) {
     console.error('Error removing chat participant:', error);
     return { success: false, error: 'Failed to remove participant' };
@@ -1210,7 +1231,7 @@ ipcMain.handle('remove-chat-participant', async (event, chatId: number, userId: 
 
 ipcMain.handle('get-chat-participants', async (event, chatId: number) => {
   try {
-    const participants = db.getChatParticipants(chatId);
+    const participants = services.chats.getParticipants(chatId);
     return { success: true, data: participants };
   } catch (error) {
     console.error('Error getting chat participants:', error);
@@ -1218,17 +1239,15 @@ ipcMain.handle('get-chat-participants', async (event, chatId: number) => {
   }
 });
 
-ipcMain.handle('update-chat-participant-role', async (event, chatId: number, userId: string, role: 'admin' | 'member') => {
+ipcMain.handle('update-chat-participant-role', async (event, chatId: number, userId: string, role: 'admin' | 'member', updatedBy: string) => {
   try {
-    const success = db.updateChatParticipantRole(chatId, userId, role);
-    if (success) {
-      // Broadcast role change to all clients
-      if (wsServer) {
-        wsServer.broadcastParticipantRoleChanged(chatId, userId, role);
-      }
-      return { success: true };
+    const success = services.chats.updateParticipantRole(chatId, userId, role, updatedBy);
+    if (success && wsServer) {
+      wsServer.broadcastParticipantRoleChanged(chatId, userId, role);
     }
-    return { success: false, error: 'Participant not found' };
+    return success
+      ? { success: true }
+      : { success: false, error: 'Participant not found' };
   } catch (error) {
     console.error('Error updating participant role:', error);
     return { success: false, error: 'Failed to update role' };
@@ -1245,12 +1264,10 @@ ipcMain.handle('get-user-chats', async (event, userId: string, limit: number, of
   }
 });
 
-// File and media operations
 ipcMain.handle('upload-file', async (event, fileData: { buffer: Buffer; fileName: string; mimeType: string }) => {
   try {
     const { buffer, fileName, mimeType } = fileData;
 
-    // Determine file type
     let type: 'image' | 'file' | 'voice' | 'video' = 'file';
     if (mimeType.startsWith('image/')) {
       type = 'image';
@@ -1260,7 +1277,6 @@ ipcMain.handle('upload-file', async (event, fileData: { buffer: Buffer; fileName
       type = 'voice';
     }
 
-    // Save file
     const subDir = type === 'image' ? 'images' : type === 'video' ? 'videos' : type === 'voice' ? 'audio' : 'files';
     const filePath = await fileStorage.saveFile(Buffer.from(buffer), fileName, subDir);
 
@@ -1311,7 +1327,7 @@ ipcMain.handle('add-media-attachment', async (event, data: {
   height?: number;
 }) => {
   try {
-    const attachmentId = db.addMediaAttachment(
+    const attachmentId = services.media.addMediaAttachment(
       data.messageId,
       data.type,
       data.fileName,
@@ -1334,7 +1350,7 @@ ipcMain.handle('add-media-attachment', async (event, data: {
 
 ipcMain.handle('get-media-attachments', async (event, messageId: number) => {
   try {
-    const attachments = db.getMediaAttachments(messageId);
+    const attachments = services.media.getMediaAttachments(messageId);
     return { success: true, data: attachments };
   } catch (error) {
     console.error('Error getting media attachments:', error);
@@ -1344,7 +1360,7 @@ ipcMain.handle('get-media-attachments', async (event, messageId: number) => {
 
 ipcMain.handle('get-media-attachments-by-chat', async (event, chatId: number, type?: 'image' | 'file' | 'voice' | 'video') => {
   try {
-    const attachments = db.getMediaAttachmentsByChat(chatId, type);
+    const attachments = services.media.getMediaAttachmentsByChat(chatId, type);
     return { success: true, data: attachments };
   } catch (error) {
     console.error('Error getting media attachments by chat:', error);
@@ -1354,8 +1370,7 @@ ipcMain.handle('get-media-attachments-by-chat', async (event, chatId: number, ty
 
 ipcMain.handle('delete-media-attachment', async (event, attachmentId: number) => {
   try {
-    // Get attachment to delete the file
-    const attachment = db.getMediaAttachmentById(attachmentId);
+    const attachment = services.media.getMediaAttachmentById(attachmentId);
     if (attachment) {
       await fileStorage.deleteFile(attachment.filePath);
       if (attachment.thumbnailPath) {
@@ -1363,7 +1378,7 @@ ipcMain.handle('delete-media-attachment', async (event, attachmentId: number) =>
       }
     }
 
-    const success = db.deleteMediaAttachment(attachmentId);
+    const success = services.media.deleteMediaAttachment(attachmentId);
     return { success };
   } catch (error) {
     console.error('Error deleting media attachment:', error);
@@ -1371,7 +1386,6 @@ ipcMain.handle('delete-media-attachment', async (event, attachmentId: number) =>
   }
 });
 
-// Poll operations
 ipcMain.handle('create-poll', async (event, data: {
   messageId: number;
   question: string;
@@ -1381,7 +1395,7 @@ ipcMain.handle('create-poll', async (event, data: {
 }) => {
   try {
     const { messageId, question, options, allowMultiple, expiresAt } = data;
-    const pollId = db.createPoll(messageId, question, options, allowMultiple, expiresAt);
+    const pollId = services.polls.createPoll(messageId, question, options, allowMultiple, expiresAt);
     if (pollId) {
       return { success: true, data: pollId };
     }
@@ -1394,7 +1408,7 @@ ipcMain.handle('create-poll', async (event, data: {
 
 ipcMain.handle('get-poll', async (event, pollId: number) => {
   try {
-    const poll = db.getPoll(pollId);
+    const poll = services.polls.getPoll(pollId);
     if (poll) {
       return { success: true, data: poll };
     }
@@ -1407,7 +1421,7 @@ ipcMain.handle('get-poll', async (event, pollId: number) => {
 
 ipcMain.handle('get-poll-by-message', async (event, messageId: number) => {
   try {
-    const poll = db.getPollByMessage(messageId);
+    const poll = services.polls.getPollByMessage(messageId);
     if (poll) {
       return { success: true, data: poll };
     }
@@ -1420,7 +1434,7 @@ ipcMain.handle('get-poll-by-message', async (event, messageId: number) => {
 
 ipcMain.handle('get-poll-options', async (event, pollId: number) => {
   try {
-    const options = db.getPollOptions(pollId);
+    const options = services.polls.getPollOptions(pollId);
     return { success: true, data: options };
   } catch (error) {
     console.error('Error getting poll options:', error);
@@ -1430,7 +1444,7 @@ ipcMain.handle('get-poll-options', async (event, pollId: number) => {
 
 ipcMain.handle('vote-poll', async (event, pollId: number, optionId: number, userId: string) => {
   try {
-    const success = db.votePoll(pollId, optionId, userId);
+    const success = services.polls.votePoll(pollId, optionId, userId);
     if (success) {
       return { success: true };
     }
@@ -1443,7 +1457,7 @@ ipcMain.handle('vote-poll', async (event, pollId: number, optionId: number, user
 
 ipcMain.handle('remove-poll-vote', async (event, pollId: number, optionId: number, userId: string) => {
   try {
-    const success = db.removePollVote(pollId, optionId, userId);
+    const success = services.polls.removePollVote(pollId, optionId, userId);
     if (success) {
       return { success: true };
     }
@@ -1456,7 +1470,7 @@ ipcMain.handle('remove-poll-vote', async (event, pollId: number, optionId: numbe
 
 ipcMain.handle('get-poll-results', async (event, pollId: number) => {
   try {
-    const results = db.getPollResults(pollId);
+    const results = services.polls.getPollResults(pollId);
     return { success: true, data: results };
   } catch (error) {
     console.error('Error getting poll results:', error);
@@ -1466,7 +1480,7 @@ ipcMain.handle('get-poll-results', async (event, pollId: number) => {
 
 ipcMain.handle('get-user-poll-votes', async (event, pollId: number, userId: string) => {
   try {
-    const votes = db.getUserPollVotes(pollId, userId);
+    const votes = services.polls.getUserPollVotes(pollId, userId);
     return { success: true, data: votes };
   } catch (error) {
     console.error('Error getting user poll votes:', error);
@@ -1474,10 +1488,9 @@ ipcMain.handle('get-user-poll-votes', async (event, pollId: number, userId: stri
   }
 });
 
-// Scheduled message operations
 ipcMain.handle('schedule-message', async (event, chatId: number, sender: string, body: string, scheduledFor: number) => {
   try {
-    const id = db.scheduleMessage(chatId, sender, body, scheduledFor);
+    const id = services.scheduledMessages.scheduleMessage(chatId, sender, body, scheduledFor);
     return { success: true, data: id };
   } catch (error) {
     console.error('Error scheduling message:', error);
@@ -1487,7 +1500,7 @@ ipcMain.handle('schedule-message', async (event, chatId: number, sender: string,
 
 ipcMain.handle('get-scheduled-message', async (event, id: number) => {
   try {
-    const message = db.getScheduledMessage(id);
+    const message = services.scheduledMessages.getScheduledMessage(id);
     if (message) {
       return { success: true, data: message };
     }
@@ -1500,7 +1513,7 @@ ipcMain.handle('get-scheduled-message', async (event, id: number) => {
 
 ipcMain.handle('get-scheduled-messages', async (event, chatId: number, status?: 'pending' | 'sent' | 'cancelled') => {
   try {
-    const messages = db.getScheduledMessages(chatId, status);
+    const messages = services.scheduledMessages.getScheduledMessages(chatId, status);
     return { success: true, data: messages };
   } catch (error) {
     console.error('Error getting scheduled messages:', error);
@@ -1510,7 +1523,7 @@ ipcMain.handle('get-scheduled-messages', async (event, chatId: number, status?: 
 
 ipcMain.handle('get-all-pending-scheduled-messages', async () => {
   try {
-    const messages = db.getAllPendingScheduledMessages();
+    const messages = services.scheduledMessages.getAllPendingScheduledMessages();
     return { success: true, data: messages };
   } catch (error) {
     console.error('Error getting pending scheduled messages:', error);
@@ -1520,7 +1533,7 @@ ipcMain.handle('get-all-pending-scheduled-messages', async () => {
 
 ipcMain.handle('cancel-scheduled-message', async (event, id: number) => {
   try {
-    const success = db.cancelScheduledMessage(id);
+    const success = services.scheduledMessages.cancelScheduledMessage(id);
     if (success) {
       return { success: true };
     }
@@ -1533,7 +1546,7 @@ ipcMain.handle('cancel-scheduled-message', async (event, id: number) => {
 
 ipcMain.handle('delete-scheduled-message', async (event, id: number) => {
   try {
-    const success = db.deleteScheduledMessage(id);
+    const success = services.scheduledMessages.deleteScheduledMessage(id);
     if (success) {
       return { success: true };
     }
@@ -1544,7 +1557,6 @@ ipcMain.handle('delete-scheduled-message', async (event, id: number) => {
   }
 });
 
-// Translation operations
 ipcMain.handle('translate-message', async (event, data: {
   messageId: number;
   text: string;
@@ -1619,10 +1631,9 @@ ipcMain.handle('get-supported-languages', async () => {
   }
 });
 
-// Contacts
 ipcMain.handle('get-contacts', async (_event, limit: number, offset: number) => {
   try {
-    const contacts = db.getContacts(limit, offset);
+    const contacts = services.contacts.getContacts(limit, offset);
     return { success: true, data: contacts };
   } catch (error) {
     console.error('Error getting contacts:', error);
@@ -1632,7 +1643,7 @@ ipcMain.handle('get-contacts', async (_event, limit: number, offset: number) => 
 
 ipcMain.handle('search-contacts', async (_event, query: string) => {
   try {
-    const contacts = db.searchContacts(query);
+    const contacts = services.contacts.searchContacts(query);
     return { success: true, data: contacts };
   } catch (error) {
     console.error('Error searching contacts:', error);
@@ -1642,7 +1653,7 @@ ipcMain.handle('search-contacts', async (_event, query: string) => {
 
 ipcMain.handle('create-chat-with-contact', async (_event, contactUserId: string) => {
   try {
-    const chatId = db.createChatWithContact(contactUserId);
+    const chatId = services.contacts.createChatWithContact(contactUserId);
     if (chatId) {
       return { success: true, data: chatId };
     } else {
@@ -1654,7 +1665,6 @@ ipcMain.handle('create-chat-with-contact', async (_event, contactUserId: string)
   }
 });
 
-// Database management
 ipcMain.handle('clear-database', async () => {
   try {
     db.clearDatabase();
@@ -1665,93 +1675,34 @@ ipcMain.handle('clear-database', async () => {
   }
 });
 
-// ==================== Authentication IPC Handlers ====================
 
 ipcMain.handle('auth:signup', async (event, username: string, password: string, email?: string, displayName?: string) => {
   try {
-    // Check if username already exists
-    const existingUser = db.getUserByUsername(username);
-    if (existingUser) {
-      return { success: false, error: 'Username already exists' };
-    }
-
-    // Derive encryption key from password
-    // Using username as salt (consistent per user)
-    securityService.setMasterKeyFromPassword(password, username);
-
-    // Create user
-    const userId = db.createUser(username, password, email, displayName);
-
-    // Create session
-    const session = db.createSession(userId);
-
-    // Get user info
-    const user = db.getUserById(userId);
-
+    const result = await services.auth.signup({ username, password, email, displayName });
     console.log('[Auth] User registered and encryption key derived');
-
-    return {
-      success: true,
-      data: {
-        user: {
-          id: user!.id,
-          username: user!.username,
-          email: user!.email,
-          displayName: user!.displayName,
-        },
-        session: {
-          token: session.token,
-          expiresAt: session.expiresAt,
-        }
-      }
-    };
+    return { success: true, data: result };
   } catch (error) {
     console.error('Error during signup:', error);
-    return { success: false, error: 'Failed to create account' };
+    const errorMsg = error instanceof Error ? error.message : 'Failed to create account';
+    return { success: false, error: errorMsg };
   }
 });
 
 ipcMain.handle('auth:login', async (event, username: string, password: string) => {
   try {
-    // Verify credentials
-    const user = db.verifyCredentials(username, password);
-    if (!user) {
-      return { success: false, error: 'Invalid username or password' };
-    }
-
-    // Derive encryption key from password
-    // Using username as salt (consistent per user)
-    securityService.setMasterKeyFromPassword(password, username);
-
-    // Create session
-    const session = db.createSession(user.id);
-
-    console.log('[Auth] User logged in and encryption key derived');
-
-    return {
-      success: true,
-      data: {
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          displayName: user.displayName,
-        },
-        session: {
-          token: session.token,
-          expiresAt: session.expiresAt,
-        }
-      }
-    };
+    const result = await services.auth.login(username, password);
+    console.log('[Auth] User logged in successfully and encryption key derived');
+    return { success: true, data: result };
   } catch (error) {
     console.error('Error during login:', error);
-    return { success: false, error: 'Failed to login' };
+    const errorMsg = error instanceof Error ? error.message : 'Failed to login';
+    return { success: false, error: errorMsg };
   }
 });
 
 ipcMain.handle('auth:logout', async (event, token: string) => {
   try {
-    db.destroySession(token);
+    services.auth.logout(token);
     return { success: true };
   } catch (error) {
     console.error('Error during logout:', error);
@@ -1761,12 +1712,12 @@ ipcMain.handle('auth:logout', async (event, token: string) => {
 
 ipcMain.handle('auth:validate-session', async (event, token: string) => {
   try {
-    const session = db.validateSession(token);
+    const session = services.auth.validateSession(token);
     if (!session) {
       return { success: false, error: 'Invalid or expired session' };
     }
 
-    const user = db.getUserById(session.userId);
+    const user = services.auth.getUser(session.userId);
     if (!user) {
       return { success: false, error: 'User not found' };
     }
@@ -1774,12 +1725,7 @@ ipcMain.handle('auth:validate-session', async (event, token: string) => {
     return {
       success: true,
       data: {
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          displayName: user.displayName,
-        },
+        user,
         session: {
           token: session.token,
           expiresAt: session.expiresAt,
@@ -1794,7 +1740,7 @@ ipcMain.handle('auth:validate-session', async (event, token: string) => {
 
 ipcMain.handle('auth:get-user-sessions', async (event, userId: number) => {
   try {
-    const sessions = db.getUserSessions(userId);
+    const sessions = services.auth.getUserSessions(userId);
     return { success: true, data: sessions };
   } catch (error) {
     console.error('Error getting user sessions:', error);
@@ -1804,7 +1750,7 @@ ipcMain.handle('auth:get-user-sessions', async (event, userId: number) => {
 
 ipcMain.handle('auth:destroy-all-sessions', async (event, userId: number) => {
   try {
-    db.destroyAllUserSessions(userId);
+    services.auth.revokeAllSessions(userId);
     return { success: true };
   } catch (error) {
     console.error('Error destroying all sessions:', error);
@@ -1812,12 +1758,10 @@ ipcMain.handle('auth:destroy-all-sessions', async (event, userId: number) => {
   }
 });
 
-// ==================== Encryption/Decryption IPC Handlers ====================
 
 ipcMain.handle('decrypt-message', async (event, ciphertext: string) => {
   try {
     if (!securityService.isEncrypted(ciphertext)) {
-      // Already plaintext, return as-is
       return { success: true, data: ciphertext };
     }
 

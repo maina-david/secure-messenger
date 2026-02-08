@@ -197,6 +197,9 @@ export interface ApiResponse<T> {
 export interface ElectronAPI {
   getChats: (limit: number, offset: number) => Promise<ApiResponse<Chat[]>>;
   getMessages: (chatId: number, limit: number, offset: number) => Promise<ApiResponse<Message[]>>;
+  getLastMessagesBatch: (chatIds: number[]) => Promise<ApiResponse<Record<number, Message>>>;
+  getMessagesBefore: (chatId: number, timestamp: number, limit: number) => Promise<ApiResponse<Message[]>>;
+  getMessagesAfter: (chatId: number, timestamp: number, limit: number) => Promise<ApiResponse<Message[]>>;
   markChatRead: (chatId: number) => Promise<ApiResponse<void>>;
   sendMessage: (chatId: number, sender: string, body: string) => Promise<ApiResponse<Message>>;
   editMessage: (messageId: number, newBody: string) => Promise<ApiResponse<Message>>;

@@ -1,16 +1,16 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-const os = require('os');
+import Database from 'better-sqlite3';
+import { join } from 'path';
+import { homedir } from 'os';
 
 // Get user data path (same as Electron app.getPath('userData'))
-const userDataPath = path.join(
-  os.homedir(),
+const userDataPath = join(
+  homedir(),
   'Library',
   'Application Support',
   'secure-messenger-desktop'
 );
 
-const dbPath = path.join(userDataPath, 'messenger.db');
+const dbPath = join(userDataPath, 'messenger.db');
 
 console.log('Database path:', dbPath);
 console.log('Clearing and reseeding database...');

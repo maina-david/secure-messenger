@@ -7,6 +7,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getMessages: (chatId: number, limit: number, offset: number) =>
     ipcRenderer.invoke('get-messages', chatId, limit, offset),
 
+  getLastMessagesBatch: (chatIds: number[]) =>
+    ipcRenderer.invoke('get-last-messages-batch', chatIds),
+
+  getMessagesBefore: (chatId: number, timestamp: number, limit: number) =>
+    ipcRenderer.invoke('get-messages-before', chatId, timestamp, limit),
+
+  getMessagesAfter: (chatId: number, timestamp: number, limit: number) =>
+    ipcRenderer.invoke('get-messages-after', chatId, timestamp, limit),
+
   markChatRead: (chatId: number) =>
     ipcRenderer.invoke('mark-chat-read', chatId),
 

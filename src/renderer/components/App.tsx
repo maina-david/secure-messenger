@@ -15,6 +15,7 @@ import { Toaster } from '@/components/ui/sonner';
 import { toast } from 'sonner';
 import { Database, WifiOff, MessageSquare, Sun, Moon, LogOut, Settings } from 'lucide-react';
 import SettingsPanel from './SettingsPanel';
+import NotificationBell from './NotificationBell';
 
 const AppContent: React.FC = () => {
   const dispatch = useDispatch<AppDispatch>();
@@ -101,6 +102,7 @@ const AppContent: React.FC = () => {
           </div>
         </div>
         <div className="flex gap-2.5">
+          <NotificationBell />
           <Button
             onClick={toggleTheme}
             variant="ghost"

@@ -1,4 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { VariableSizeList as List } from 'react-window';
+import { ArrowDown } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import { Message, Reaction, ReadReceipt, PinnedMessage } from '../types';
 import MessageRow from './MessageRow';
 import MessageTimeSeparator from './MessageTimeSeparator';
@@ -17,6 +20,9 @@ interface MessageListProps {
   replies: Record<number, number>;
   onScrollToMessage?: (messageId: number) => void;
   onReactionsChange?: () => void;
+  onLoadMore?: () => void;
+  hasMore?: boolean;
+  isLoading?: boolean;
   isTyping?: boolean;
   typingUserName?: string;
 }
@@ -31,21 +37,95 @@ const MessageList: React.FC<MessageListProps> = ({
   replies,
   onScrollToMessage,
   onReactionsChange,
+  onLoadMore,
+  hasMore = false,
+  isLoading = false,
   isTyping = false,
   typingUserName,
 }) => {
   const dispatch = useAppDispatch();
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
-  const listRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<List>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const loadingTriggered = useRef(false);
+  const hasUserScrolled = useRef(false);
+  const [containerHeight, setContainerHeight] = useState(600);
+  const itemSizeCache = useRef<Map<number, number>>(new Map());
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 
   const pinnedMessageIds = new Set(pinnedMessages.map((pm) => pm.messageId));
 
   useEffect(() => {
+    const measureHeight = () => {
+      if (containerRef.current) {
+        setContainerHeight(containerRef.current.clientHeight);
+      }
+    };
+    measureHeight();
+    window.addEventListener('resize', measureHeight);
+    return () => window.removeEventListener('resize', measureHeight);
+  }, []);
+
+  useEffect(() => {
     if (listRef.current && messages.length > 0) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
+      hasUserScrolled.current = false;
+      listRef.current.scrollToItem(messages.length - 1, 'end');
     }
-  }, [messages.length]);
+  }, [chatId]);
+
+  const prevScrollOffset = useRef<number>(0);
+
+  const handleScroll = useCallback(({ scrollOffset, scrollUpdateWasRequested }: { scrollOffset: number; scrollUpdateWasRequested: boolean }) => {
+    const scrollingUp = scrollOffset < prevScrollOffset.current;
+
+    if (Math.abs(scrollOffset - prevScrollOffset.current) > 5) {
+      hasUserScrolled.current = true;
+    }
+
+    if (listRef.current && containerRef.current) {
+      const listHeight = containerRef.current.clientHeight;
+      const totalHeight = messages.length * 100;
+      const isNearBottom = scrollOffset + listHeight >= totalHeight - 200;
+      setShowScrollToBottom(!isNearBottom && messages.length > 0);
+    }
+
+    prevScrollOffset.current = scrollOffset;
+
+    if (!hasMore || isLoading || loadingTriggered.current || !onLoadMore || !hasUserScrolled.current) {
+      return;
+    }
+
+    if (scrollingUp && scrollOffset < 200 && scrollOffset > 0) {
+      loadingTriggered.current = true;
+      onLoadMore();
+    }
+  }, [hasMore, isLoading, onLoadMore, messages.length]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      loadingTriggered.current = false;
+    }
+  }, [isLoading]);
+
+  const getItemSize = useCallback((index: number) => {
+    if (itemSizeCache.current.has(index)) {
+      return itemSizeCache.current.get(index)!;
+    }
+
+    const message = messages[index];
+    const previousMessage = index > 0 ? messages[index - 1] : undefined;
+    const showTimeSeparator = shouldShowTimeSeparator(message, previousMessage);
+
+    const baseHeight = 80;
+    const bodyLines = Math.ceil(message.body.length / 50);
+    const timeSeparatorHeight = showTimeSeparator ? 40 : 0;
+    const replyHeight = replies[message.id] ? 40 : 0;
+    const reactionsHeight = (reactions[message.id]?.length || 0) > 0 ? 30 : 0;
+
+    const estimatedHeight = baseHeight + (bodyLines * 20) + timeSeparatorHeight + replyHeight + reactionsHeight;
+    return Math.max(estimatedHeight, 60);
+  }, [messages, replies, reactions]);
 
   const handleEdit = (message: Message) => {
     setEditingMessage(message);
@@ -69,7 +149,6 @@ const MessageList: React.FC<MessageListProps> = ({
 
   const handleReply = (message: Message) => {
     setReplyingTo(message);
-    // Emit event to MessageInput to show reply preview
     window.dispatchEvent(
       new CustomEvent('reply-to-message', { detail: message })
     );
@@ -110,14 +189,12 @@ const MessageList: React.FC<MessageListProps> = ({
 
   const handleReact = async (messageId: number, emoji: string) => {
     try {
-      // Check if user already reacted with this emoji
       const messageReactions = reactions[messageId] || [];
       const existingReaction = messageReactions.find(
         (r) => r.userId === currentUserId && r.emoji === emoji
       );
 
       if (existingReaction) {
-        // Remove reaction
         const response = await window.electronAPI.removeReaction(
           messageId,
           currentUserId,
@@ -126,11 +203,9 @@ const MessageList: React.FC<MessageListProps> = ({
         if (!response.success) {
           toast.error(response.error || 'Failed to remove reaction');
         } else {
-          // Reload reactions after successful removal
           onReactionsChange?.();
         }
       } else {
-        // Add reaction
         const response = await window.electronAPI.addReaction(
           messageId,
           chatId,
@@ -140,7 +215,6 @@ const MessageList: React.FC<MessageListProps> = ({
         if (!response.success) {
           toast.error(response.error || 'Failed to add reaction');
         } else {
-          // Reload reactions after successful addition
           onReactionsChange?.();
         }
       }
@@ -150,11 +224,9 @@ const MessageList: React.FC<MessageListProps> = ({
   };
 
   const handleNavigateToReply = (messageId: number) => {
-    // Find the message element and scroll to it
     const messageElement = document.getElementById(`message-${messageId}`);
     if (messageElement) {
       messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      // Highlight the message briefly
       onScrollToMessage?.(messageId);
     }
   };
@@ -170,11 +242,51 @@ const MessageList: React.FC<MessageListProps> = ({
     return !isSameDay(new Date(currentMessage.ts), new Date(previousMessage.ts));
   };
 
+  const scrollToBottom = useCallback(() => {
+    if (listRef.current && messages.length > 0) {
+      listRef.current.scrollToItem(messages.length - 1, 'end');
+      setShowScrollToBottom(false);
+    }
+  }, [messages.length]);
+
+  const Row = useCallback(({ index, style }: { index: number; style: React.CSSProperties }) => {
+    const message = messages[index];
+    const messageReactions = reactions[message.id] || [];
+    const messageReceipts = readReceipts[message.id] || [];
+    const isPinned = pinnedMessageIds.has(message.id);
+    const replyToMessage = getReplyToMessage(message.id);
+    const previousMessage = index > 0 ? messages[index - 1] : undefined;
+    const showTimeSeparator = shouldShowTimeSeparator(message, previousMessage);
+
+    return (
+      <div style={style}>
+        {showTimeSeparator && <MessageTimeSeparator timestamp={message.ts} />}
+        <div id={`message-${message.id}`} className="px-4">
+          <MessageRow
+            message={message}
+            currentUserId={currentUserId}
+            reactions={messageReactions}
+            readReceipts={messageReceipts.length}
+            isPinned={isPinned}
+            replyToMessage={replyToMessage}
+            onEdit={handleEdit}
+            onDelete={handleDelete}
+            onReply={handleReply}
+            onPin={handlePin}
+            onForward={handleForward}
+            onReact={handleReact}
+            onNavigateToReply={handleNavigateToReply}
+          />
+        </div>
+      </div>
+    );
+  }, [messages, reactions, readReceipts, pinnedMessageIds, replies, currentUserId]);
+
   if (messages.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center text-muted-foreground">
+      <div className="flex items-center justify-center flex-1 text-muted-foreground">
         <div className="text-center">
-          <p className="text-lg font-medium mb-2">No messages yet</p>
+          <p className="mb-2 text-lg font-medium">No messages yet</p>
           <p className="text-sm">Start a conversation by sending a message below</p>
         </div>
       </div>
@@ -183,47 +295,42 @@ const MessageList: React.FC<MessageListProps> = ({
 
   return (
     <div
-      ref={listRef}
-      className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-border scrollbar-track-background scroll-smooth"
+      ref={containerRef}
+      className="relative flex-1 overflow-hidden"
     >
-      <div className="py-4 space-y-1">
-        {messages.map((message, index) => {
-          const messageReactions = reactions[message.id] || [];
-          const messageReceipts = readReceipts[message.id] || [];
-          const isPinned = pinnedMessageIds.has(message.id);
-          const replyToMessage = getReplyToMessage(message.id);
-          const previousMessage = index > 0 ? messages[index - 1] : undefined;
-          const showTimeSeparator = shouldShowTimeSeparator(message, previousMessage);
-
-          return (
-            <React.Fragment key={message.id}>
-              {showTimeSeparator && <MessageTimeSeparator timestamp={message.ts} />}
-              <div
-                id={`message-${message.id}`}
-                className="animate-in fade-in slide-in-from-bottom-2 duration-300"
-              >
-                <MessageRow
-                  message={message}
-                  currentUserId={currentUserId}
-                  reactions={messageReactions}
-                  readReceipts={messageReceipts.length}
-                  isPinned={isPinned}
-                  replyToMessage={replyToMessage}
-                  onEdit={handleEdit}
-                  onDelete={handleDelete}
-                  onReply={handleReply}
-                  onPin={handlePin}
-                  onForward={handleForward}
-                  onReact={handleReact}
-                  onNavigateToReply={handleNavigateToReply}
-                />
-              </div>
-            </React.Fragment>
-          );
-        })}
-
-        {isTyping && <TypingIndicator userName={typingUserName} />}
-      </div>
+      {isLoading && hasMore && (
+        <div className="absolute z-10 transform -translate-x-1/2 top-2 left-1/2">
+          <div className="px-4 py-2 border rounded-lg shadow-lg bg-background">
+            <p className="text-sm text-muted-foreground">Loading more messages...</p>
+          </div>
+        </div>
+      )}
+      <List
+        ref={listRef}
+        height={containerHeight}
+        itemCount={messages.length}
+        itemSize={getItemSize}
+        width="100%"
+        onScroll={handleScroll}
+        className="scrollbar-thin scrollbar-thumb-border scrollbar-track-background"
+      >
+        {Row}
+      </List>
+      {isTyping && (
+        <div className="absolute bottom-0 left-0 right-0 px-4 pb-2 bg-linear-to-t from-background to-transparent">
+          <TypingIndicator userName={typingUserName} />
+        </div>
+      )}
+      {showScrollToBottom && (
+        <Button
+          onClick={scrollToBottom}
+          className="absolute z-20 p-2 shadow-lg bottom-4 right-4 rounded-full h-10 w-10"
+          size="icon"
+          title="Scroll to bottom"
+        >
+          <ArrowDown className="w-5 h-5" />
+        </Button>
+      )}
     </div>
   );
 };

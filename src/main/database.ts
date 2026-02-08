@@ -1,3 +1,16 @@
+/**
+ * @deprecated This file is being phased out in favor of the new service layer architecture.
+ *
+ * New architecture (preferred):
+ * - Repositories: src/main/database/*.ts (MessageRepository, ChatRepository, UserRepository)
+ * - Services: src/main/services/*.ts (MessageService, ChatService, AuthService)
+ *
+ * This file is kept for backward compatibility and will be removed in a future version.
+ * For new features, use the service layer instead of DatabaseService.
+ *
+ * See ARCHITECTURE.md for details on the new architecture.
+ */
+
 import Database from 'better-sqlite3';
 import * as path from 'path';
 import { app } from 'electron';
@@ -515,6 +528,19 @@ export class DatabaseService {
       CREATE INDEX IF NOT EXISTS idx_sessions_expiresAt
         ON sessions(expiresAt);
 
+      -- Chat encryption keys (per-chat encryption)
+      CREATE TABLE IF NOT EXISTS chat_keys (
+        chatId INTEGER PRIMARY KEY,
+        encryptedKeys TEXT NOT NULL,
+        version INTEGER DEFAULT 1,
+        createdAt INTEGER NOT NULL,
+        lastRotatedAt INTEGER NOT NULL,
+        FOREIGN KEY (chatId) REFERENCES chats(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_chat_keys_lastRotatedAt
+        ON chat_keys(lastRotatedAt);
+
       -- Full-text search index
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(body, content=messages, content_rowid=id);
     `);
@@ -669,6 +695,57 @@ export class DatabaseService {
       console.error('Error creating group chat:', error);
       return null;
     }
+  }
+
+  // Chat keys management for per-chat encryption
+  storeChatKeys(chatId: number, encryptedKeys: string, version: number = 1): void {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      INSERT INTO chat_keys (chatId, encryptedKeys, version, createdAt, lastRotatedAt)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(chatId) DO UPDATE SET
+        encryptedKeys = excluded.encryptedKeys,
+        version = excluded.version,
+        lastRotatedAt = excluded.lastRotatedAt
+    `);
+    stmt.run(chatId, encryptedKeys, version, now, now);
+  }
+
+  getChatKeys(chatId: number): { encryptedKeys: string; version: number; createdAt: number; lastRotatedAt: number } | null {
+    const stmt = this.db.prepare(`
+      SELECT encryptedKeys, version, createdAt, lastRotatedAt
+      FROM chat_keys
+      WHERE chatId = ?
+    `);
+    return stmt.get(chatId) as any || null;
+  }
+
+  updateChatKeys(chatId: number, encryptedKeys: string, version: number): void {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      UPDATE chat_keys
+      SET encryptedKeys = ?, version = ?, lastRotatedAt = ?
+      WHERE chatId = ?
+    `);
+    stmt.run(encryptedKeys, version, now, chatId);
+  }
+
+  deleteChatKeys(chatId: number): void {
+    const stmt = this.db.prepare(`
+      DELETE FROM chat_keys WHERE chatId = ?
+    `);
+    stmt.run(chatId);
+  }
+
+  getAllChatsNeedingKeyRotation(daysThreshold: number = 30): number[] {
+    const thresholdTimestamp = Date.now() - (daysThreshold * 24 * 60 * 60 * 1000);
+    const stmt = this.db.prepare(`
+      SELECT chatId
+      FROM chat_keys
+      WHERE lastRotatedAt < ?
+    `);
+    const rows = stmt.all(thresholdTimestamp) as { chatId: number }[];
+    return rows.map(row => row.chatId);
   }
 
   updateChatLastMessage(chatId: number, timestamp: number) {
@@ -2176,20 +2253,62 @@ export class DatabaseService {
   /**
    * Hash a password using PBKDF2
    */
-  private hashPassword(password: string): string {
-    const salt = crypto.randomBytes(16).toString('hex');
-    const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
-    return `${salt}:${hash}`;
+  /**
+   * Hash a password using Argon2id (recommended) or PBKDF2 600k (fallback)
+   * Format: argon2id$<hash> or pbkdf2$<salt>:<hash>
+   */
+  private async hashPassword(password: string): Promise<string> {
+    try {
+      // Use Argon2id (OWASP recommended)
+      const argon2 = require('argon2');
+      const hash = await argon2.hash(password, {
+        type: argon2.argon2id,
+        memoryCost: 65536, // 64 MB
+        timeCost: 3,
+        parallelism: 4
+      });
+      return `argon2id$${hash}`;
+    } catch (error) {
+      // Fallback to PBKDF2 with 600k iterations
+      console.warn('[Database] Argon2id not available, falling back to PBKDF2 600k');
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = crypto.pbkdf2Sync(password, salt, 600000, 64, 'sha512').toString('hex');
+      return `pbkdf2$${salt}:${hash}`;
+    }
   }
 
   /**
    * Verify a password against a hash
+   * Supports both Argon2id and PBKDF2 formats
    */
-  private verifyPassword(password: string, storedHash: string): boolean {
-    const [salt, hash] = storedHash.split(':');
-    if (!salt || !hash) return false;
-    const verifyHash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
-    return hash === verifyHash;
+  private async verifyPassword(password: string, storedHash: string): Promise<boolean> {
+    try {
+      // Check format
+      if (storedHash.startsWith('argon2id$')) {
+        // Argon2id format
+        const hash = storedHash.substring(9); // Remove 'argon2id$' prefix
+        const argon2 = require('argon2');
+        return await argon2.verify(hash, password);
+      } else if (storedHash.startsWith('pbkdf2$')) {
+        // New PBKDF2 600k format
+        const hashPart = storedHash.substring(7); // Remove 'pbkdf2$' prefix
+        const [salt, hash] = hashPart.split(':');
+        if (!salt || !hash) return false;
+        const verifyHash = crypto.pbkdf2Sync(password, salt, 600000, 64, 'sha512').toString('hex');
+        // Timing-safe comparison to prevent timing attacks
+        return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(verifyHash));
+      } else {
+        // Legacy format (old PBKDF2 100k) - still support for backward compatibility
+        const [salt, hash] = storedHash.split(':');
+        if (!salt || !hash) return false;
+        const verifyHash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+        // Timing-safe comparison
+        return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(verifyHash));
+      }
+    } catch (error) {
+      console.error('[Database] Password verification failed:', error);
+      return false;
+    }
   }
 
   /**
@@ -2202,8 +2321,8 @@ export class DatabaseService {
   /**
    * Create a new user account
    */
-  createUser(username: string, password: string, email?: string, displayName?: string): number {
-    const passwordHash = this.hashPassword(password);
+  async createUser(username: string, password: string, email?: string, displayName?: string): Promise<number> {
+    const passwordHash = await this.hashPassword(password);
     const now = Date.now();
 
     const stmt = this.db.prepare(`
@@ -2218,12 +2337,14 @@ export class DatabaseService {
   /**
    * Verify user credentials and return user if valid
    */
-  verifyCredentials(username: string, password: string): User | null {
+  async verifyCredentials(username: string, password: string): Promise<User | null> {
     const stmt = this.db.prepare('SELECT * FROM users WHERE username = ?');
     const user = stmt.get(username) as User | undefined;
 
     if (!user) return null;
-    if (!this.verifyPassword(password, user.passwordHash)) return null;
+
+    const isValid = await this.verifyPassword(password, user.passwordHash);
+    if (!isValid) return null;
 
     // Update last login time
     const updateStmt = this.db.prepare('UPDATE users SET lastLoginAt = ? WHERE id = ?');

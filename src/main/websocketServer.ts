@@ -1,5 +1,5 @@
 import { WebSocketServer, WebSocket } from 'ws';
-import { DatabaseService } from './database';
+import { Services } from './services';
 
 export interface NewMessageEvent {
   type: 'NEW_MESSAGE';
@@ -241,7 +241,7 @@ interface ClientMetadata {
 
 export class MessengerWebSocketServer {
   private wss: WebSocketServer;
-  private db: DatabaseService;
+  private services: Services;
   private messageInterval?: NodeJS.Timeout;
   private pingInterval?: NodeJS.Timeout;
   private clients: Map<WebSocket, ClientMetadata> = new Map();
@@ -250,8 +250,8 @@ export class MessengerWebSocketServer {
   private readonly MAX_MESSAGES_PER_MINUTE = 60;
   private readonly RATE_LIMIT_WINDOW = 60000; // 1 minute
 
-  constructor(port: number, db: DatabaseService) {
-    this.db = db;
+  constructor(port: number, services: Services) {
+    this.services = services;
     this.wss = new WebSocketServer({ port });
 
     this.wss.on('connection', (ws: WebSocket) => {
@@ -288,6 +288,9 @@ export class MessengerWebSocketServer {
           // Handle message types
           if (message.type === 'PONG') {
             // Client responded to ping
+          } else if (message.type === 'SEND_MESSAGE') {
+            // Handle queued message from client
+            this.handleSendMessage(ws, message);
           } else if (message.type === 'TYPING_START') {
             this.broadcastTypingStart(message.chatId, message.userId, message.userName);
           } else if (message.type === 'TYPING_STOP') {
@@ -396,9 +399,9 @@ export class MessengerWebSocketServer {
     }
   }
 
-  private sendRandomMessage() {
+  private async sendRandomMessage() {
     // Get all chats
-    const chats = this.db.getChatList(200, 0);
+    const chats = this.services.chats.getChatList(200, 0);
     if (chats.length === 0) return;
 
     // Pick a random chat
@@ -421,19 +424,22 @@ export class MessengerWebSocketServer {
 
     const sender = senders[Math.floor(Math.random() * senders.length)];
     const body = messageTemplates[Math.floor(Math.random() * messageTemplates.length)];
-    const ts = Date.now();
 
-    // Insert into database
-    const messageId = this.db.createMessage(randomChat.id, ts, sender, body);
+    // Insert into database using service layer
+    const message = await this.services.messages.sendMessage({
+      chatId: randomChat.id,
+      sender,
+      body
+    });
 
     // Broadcast to all connected clients
     const event: NewMessageEvent = {
       type: 'NEW_MESSAGE',
-      chatId: randomChat.id,
-      messageId,
-      ts,
-      sender,
-      body
+      chatId: message.chatId,
+      messageId: message.id,
+      ts: message.ts,
+      sender: message.sender,
+      body: message.body
     };
 
     this.broadcast(event);
@@ -444,6 +450,79 @@ export class MessengerWebSocketServer {
       type: 'PING'
     };
     this.broadcast(event);
+  }
+
+  /**
+   * Handle incoming SEND_MESSAGE from client message queue
+   */
+  private async handleSendMessage(ws: WebSocket, message: any) {
+    try {
+      const { queueId, chatId, sender, body, timestamp } = message;
+
+      // Validate required fields
+      if (!queueId || !chatId || !sender || !body) {
+        this.sendNack(ws, queueId || 'unknown', 'Missing required fields');
+        return;
+      }
+
+      // Save message to database using service layer
+      const savedMessage = await this.services.messages.sendMessage({
+        chatId,
+        sender,
+        body,
+        timestamp
+      });
+
+      if (savedMessage) {
+        // Send ACK back to the sender
+        this.sendAck(ws, queueId, savedMessage.id);
+
+        // Broadcast the new message to all other clients
+        this.broadcastNewMessage({
+          id: savedMessage.id,
+          chatId: savedMessage.chatId,
+          ts: savedMessage.ts,
+          sender: savedMessage.sender,
+          body: savedMessage.body
+        });
+      } else {
+        this.sendNack(ws, queueId, 'Failed to save message to database');
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      console.error('[WebSocket] Error handling SEND_MESSAGE:', errorMsg);
+      this.sendNack(ws, message.queueId || 'unknown', errorMsg);
+    }
+  }
+
+  /**
+   * Send ACK to client
+   */
+  private sendAck(ws: WebSocket, queueId: string, messageId: number) {
+    try {
+      ws.send(JSON.stringify({
+        type: 'MESSAGE_ACK',
+        queueId,
+        messageId
+      }));
+    } catch (error) {
+      console.error('[WebSocket] Failed to send ACK:', error);
+    }
+  }
+
+  /**
+   * Send NACK to client
+   */
+  private sendNack(ws: WebSocket, queueId: string, error: string) {
+    try {
+      ws.send(JSON.stringify({
+        type: 'MESSAGE_NACK',
+        queueId,
+        error
+      }));
+    } catch (error) {
+      console.error('[WebSocket] Failed to send NACK:', error);
+    }
   }
 
   private broadcast(event: ServerEvent) {

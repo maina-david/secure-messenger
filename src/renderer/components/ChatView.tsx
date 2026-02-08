@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Settings, Download, Search, Users, MoreVertical, X } from 'lucide-react';
+import { Settings, Download, Search, Users, MoreVertical, X, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -52,11 +52,13 @@ const ChatView: React.FC<ChatViewProps> = ({ chatId, currentUserId, className })
   const [searchResults, setSearchResults] = useState<Message[]>([]);
   const [currentSearchIndex, setCurrentSearchIndex] = useState(0);
 
-  // Ref for infinite scroll sentinel
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const hasUserInteracted = useRef(false);
 
   useEffect(() => {
     if (!chatId) return;
+
+    hasUserInteracted.current = false;
 
     const loadChatData = async () => {
       try {
@@ -120,16 +122,19 @@ const ChatView: React.FC<ChatViewProps> = ({ chatId, currentUserId, className })
     }
   }, [chatId]);
 
-  // Load older messages
+  // Load older messages (infinite scroll)
   const loadOlderMessages = useCallback(async () => {
-    if (!chatId || isLoadingMore || !hasMoreMessages) return;
+    if (!chatId || isLoadingMore || !hasMoreMessages || messages.length === 0) return;
 
     setIsLoadingMore(true);
     try {
-      const offset = messages.length;
-      const messagesResponse = await window.electronAPI.getMessages(chatId, 50, offset);
+      // Get timestamp of oldest message for cursor-based pagination
+      const oldestTimestamp = messages[0].ts;
+      const messagesResponse = await window.electronAPI.getMessagesBefore(chatId, oldestTimestamp, 50);
+
       if (messagesResponse.success && messagesResponse.data) {
         const olderMessages = messagesResponse.data;
+        // Prepend older messages (they come in DESC order from DB)
         setMessages((prev) => [...olderMessages, ...prev]);
         setHasMoreMessages(olderMessages.length === 50);
 
@@ -149,22 +154,21 @@ const ChatView: React.FC<ChatViewProps> = ({ chatId, currentUserId, className })
     } finally {
       setIsLoadingMore(false);
     }
-  }, [chatId, messages.length, isLoadingMore, hasMoreMessages, replies]);
+  }, [chatId, messages, isLoadingMore, hasMoreMessages, replies]);
 
-  // Infinite scroll: Observe sentinel element to trigger loading
   useEffect(() => {
     if (!sentinelRef.current || !hasMoreMessages) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
         const [entry] = entries;
-        if (entry.isIntersecting && !isLoadingMore && hasMoreMessages) {
+        if (entry.isIntersecting && !isLoadingMore && hasMoreMessages && hasUserInteracted.current) {
           loadOlderMessages();
         }
       },
       {
-        root: null, // viewport
-        rootMargin: '100px', // Trigger 100px before reaching the sentinel
+        root: null,
+        rootMargin: '100px',
         threshold: 0.1,
       }
     );
@@ -175,6 +179,18 @@ const ChatView: React.FC<ChatViewProps> = ({ chatId, currentUserId, className })
       observer.disconnect();
     };
   }, [loadOlderMessages, hasMoreMessages, isLoadingMore]);
+
+  useEffect(() => {
+    const handleScroll = () => {
+      hasUserInteracted.current = true;
+    };
+
+    const messageContainer = document.querySelector('[data-message-container]');
+    if (messageContainer) {
+      messageContainer.addEventListener('scroll', handleScroll, { once: true });
+      return () => messageContainer.removeEventListener('scroll', handleScroll);
+    }
+  }, [chatId]);
 
   // Listen to custom events from MessageList
   useEffect(() => {
@@ -432,32 +448,43 @@ const ChatView: React.FC<ChatViewProps> = ({ chatId, currentUserId, className })
         />
       )}
 
-      {/* Infinite Scroll Sentinel + Loading Indicator */}
       {hasMoreMessages && messages.length > 0 && (
-        <div className="flex items-center justify-center py-2 border-b border-border/40">
-          {/* Sentinel element for infinite scroll */}
+        <div className="flex items-center justify-center py-3 border-b border-border/40">
           <div ref={sentinelRef} className="h-1" />
-
-          {/* Loading indicator */}
-          {isLoadingMore && (
+          {isLoadingMore ? (
             <div className="text-xs text-muted-foreground">
               Loading older messages...
             </div>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={loadOlderMessages}
+              disabled={isLoadingMore}
+              className="gap-2"
+            >
+              <ChevronUp className="w-4 h-4" />
+              Load older messages
+            </Button>
           )}
         </div>
       )}
 
-      {/* Message List */}
-      <MessageList
-        chatId={chatId}
-        messages={messages}
-        currentUserId={currentUserId}
-        reactions={reactions}
-        readReceipts={readReceipts}
-        pinnedMessages={pinnedMessages}
-        replies={replies}
-        onReactionsChange={reloadReactions}
-      />
+      <div data-message-container className="flex-1 overflow-hidden">
+        <MessageList
+          chatId={chatId}
+          messages={messages}
+          currentUserId={currentUserId}
+          reactions={reactions}
+          readReceipts={readReceipts}
+          pinnedMessages={pinnedMessages}
+          replies={replies}
+          onReactionsChange={reloadReactions}
+          onLoadMore={loadOlderMessages}
+          hasMore={hasMoreMessages}
+          isLoading={isLoadingMore}
+        />
+      </div>
 
       {/* Message Input */}
       <MessageInput chatId={chatId} onSendMessage={handleSendMessage} disabled={!chatId} />

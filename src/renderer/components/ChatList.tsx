@@ -1,7 +1,7 @@
 import React, { useEffect, useCallback, useState, useMemo, useRef } from 'react';
 import { FixedSizeList as List } from 'react-window';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
-import { fetchChats } from '../store/chatsSlice';
+import { fetchChats, markChatAsRead } from '../store/chatsSlice';
 import { selectChat } from '../store/messagesSlice';
 import { Chat, Message } from '../types';
 import { Badge } from '@/components/ui/badge';
@@ -29,30 +29,28 @@ const ChatList: React.FC<ChatListProps> = ({ onChatSelect }) => {
   // Create a stable array of chat IDs to avoid infinite loops
   const chatIds = useMemo(() => chats.map(chat => chat.id).join(','), [chats]);
 
-  // Load last message for each chat only when chat IDs change
+  // Load last messages for all chats in a single batch call (optimized!)
   useEffect(() => {
     const loadLastMessages = async () => {
-      const messagesMap: Record<number, Message> = { ...lastMessages };
-      let hasNewMessages = false;
+      // Get only the chat IDs we haven't loaded yet
+      const newChatIds = chats
+        .filter(chat => !loadedChatsRef.current.has(chat.id))
+        .map(chat => chat.id);
 
-      for (const chat of chats) {
-        // Only load if we haven't loaded this chat before
-        if (!loadedChatsRef.current.has(chat.id)) {
-          try {
-            const response = await window.electronAPI.getMessages(chat.id, 1, 0);
-            if (response.success && response.data && response.data.length > 0) {
-              messagesMap[chat.id] = response.data[0];
-              hasNewMessages = true;
-            }
-            loadedChatsRef.current.add(chat.id);
-          } catch (error) {
-            console.error(`Failed to load last message for chat ${chat.id}:`, error);
-          }
+      if (newChatIds.length === 0) return;
+
+      try {
+        // Single batch API call instead of N individual calls!
+        const response = await window.electronAPI.getLastMessagesBatch(newChatIds);
+
+        if (response.success && response.data) {
+          setLastMessages(prev => ({ ...prev, ...response.data }));
+
+          // Mark these chats as loaded
+          newChatIds.forEach(id => loadedChatsRef.current.add(id));
         }
-      }
-
-      if (hasNewMessages) {
-        setLastMessages(messagesMap);
+      } catch (error) {
+        console.error('Failed to load last messages batch:', error);
       }
     };
 
@@ -61,10 +59,13 @@ const ChatList: React.FC<ChatListProps> = ({ onChatSelect }) => {
     }
   }, [chatIds]);
 
-  const handleChatClick = useCallback((chat: Chat) => {
+  const handleChatClick = useCallback(async (chat: Chat) => {
     dispatch(selectChat(chat.id));
     onChatSelect(chat.id);
-    window.electronAPI.markChatRead(chat.id);
+    const response = await window.electronAPI.markChatRead(chat.id);
+    if (response.success) {
+      dispatch(markChatAsRead(chat.id));
+    }
   }, [dispatch, onChatSelect]);
 
   const formatTime = (timestamp: number) => {

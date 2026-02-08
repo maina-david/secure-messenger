@@ -71,7 +71,7 @@ const EditMessageDialog: React.FC<EditMessageDialogProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[525px]">
+      <DialogContent className="sm:max-w-131.25">
         <DialogHeader>
           <DialogTitle>Edit Message</DialogTitle>
           <DialogDescription>
@@ -85,7 +85,7 @@ const EditMessageDialog: React.FC<EditMessageDialogProps> = ({
             onChange={(e) => setEditedBody(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Edit your message..."
-            className="min-h-[120px]"
+            className="min-h-30"
             autoFocus
           />
           <div className="text-xs text-muted-foreground">

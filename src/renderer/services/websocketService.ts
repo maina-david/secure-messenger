@@ -8,6 +8,8 @@ import { addMessage, editMessage, deleteMessage } from '../store/messagesSlice';
 import { updateChatLastMessage } from '../store/chatsSlice';
 import { Message } from '../types';
 import { toast } from 'sonner';
+import { messageQueueService, QueuedMessage } from './MessageQueueService';
+import { syncService } from './SyncService';
 
 interface NewMessageEvent {
   type: 'NEW_MESSAGE';
@@ -34,7 +36,19 @@ interface PingEvent {
   type: 'PING';
 }
 
-type ServerEvent = NewMessageEvent | MessageEditedEvent | MessageDeletedEvent | PingEvent;
+interface MessageAckEvent {
+  type: 'MESSAGE_ACK';
+  queueId: string; // Queue ID from client
+  messageId: number; // Database ID from server
+}
+
+interface MessageNackEvent {
+  type: 'MESSAGE_NACK';
+  queueId: string;
+  error: string;
+}
+
+type ServerEvent = NewMessageEvent | MessageEditedEvent | MessageDeletedEvent | PingEvent | MessageAckEvent | MessageNackEvent;
 
 export class WebSocketService {
   private ws: WebSocket | null = null;
@@ -50,6 +64,12 @@ export class WebSocketService {
     if (response.success && response.data) {
       this.port = response.data;
     }
+
+    // Set up message queue callback
+    messageQueueService.setOnSend(async (message) => {
+      await this.sendQueuedMessage(message);
+    });
+
     this.connect();
   }
 
@@ -63,10 +83,20 @@ export class WebSocketService {
     try {
       this.ws = new WebSocket(`ws://localhost:${this.port}`);
 
-      this.ws.onopen = () => {
+      this.ws.onopen = async () => {
         console.log('WebSocket connected');
         store.dispatch(setConnectionStatus('connected'));
         this.startHeartbeat();
+
+        // Sync any missed messages while offline
+        try {
+          await syncService.syncMissedMessages();
+        } catch (error) {
+          console.error('[WebSocket] Failed to sync missed messages:', error);
+        }
+
+        // Process any pending messages in the queue
+        messageQueueService.processQueue();
       };
 
       this.ws.onmessage = (event) => {
@@ -113,6 +143,12 @@ export class WebSocketService {
       case 'PING':
         this.handlePing();
         break;
+      case 'MESSAGE_ACK':
+        this.handleMessageAck(event);
+        break;
+      case 'MESSAGE_NACK':
+        this.handleMessageNack(event);
+        break;
     }
   }
 
@@ -143,19 +179,8 @@ export class WebSocketService {
       timestamp: event.ts,
     }));
 
-    const state = store.getState();
-    const selectedChatId = state.messages.selectedChatId;
-    const isFromCurrentUser = event.sender === 'You';
-
-    if (!isFromCurrentUser && event.chatId !== selectedChatId) {
-      const chat = state.chats.chats.find(c => c.id === event.chatId);
-      const chatTitle = chat?.title || 'Unknown';
-
-      toast.message(`${event.sender}`, {
-        description: messageBody,
-        duration: 4000,
-      });
-    }
+    // Update sync time for this chat
+    syncService.updateChatSyncTime(event.chatId, event.ts);
   }
 
   private async handleMessageEdited(event: MessageEditedEvent) {
@@ -190,20 +215,59 @@ export class WebSocketService {
     }
   }
 
+  private handleMessageAck(event: MessageAckEvent) {
+    messageQueueService.markAsSent(event.queueId);
+    console.log(`Message ${event.queueId} acknowledged by server with ID ${event.messageId}`);
+  }
+
+  private handleMessageNack(event: MessageNackEvent) {
+    messageQueueService.markAsFailed(event.queueId, event.error);
+    console.error(`Message ${event.queueId} rejected by server: ${event.error}`);
+    toast.error(`Failed to send message: ${event.error}`);
+  }
+
+  /**
+   * Send a message through the queue system
+   */
+  sendMessage(chatId: number, sender: string, body: string): string {
+    const queueId = messageQueueService.enqueue(chatId, sender, body);
+    return queueId;
+  }
+
+  /**
+   * Actually send a queued message over WebSocket
+   */
+  private async sendQueuedMessage(message: QueuedMessage): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+
+    // Send message with queue ID for ACK matching
+    this.ws.send(JSON.stringify({
+      type: 'SEND_MESSAGE',
+      queueId: message.id,
+      chatId: message.chatId,
+      sender: message.sender,
+      body: message.body,
+      timestamp: message.timestamp,
+    }));
+  }
+
   private startHeartbeat() {
     this.stopHeartbeat();
-    // Check for missed pings every 15 seconds
+    // Check for missed pings every 5 seconds (improved from 15s)
     this.heartbeatTimeout = setInterval(() => {
       const state = store.getState();
       const lastPing = state.websocket.lastPingTime;
       const now = Date.now();
 
-      // If no ping in 30 seconds, consider connection dead
-      if (lastPing && now - lastPing > 30000) {
-        console.warn('No ping received for 30 seconds, reconnecting...');
+      // If no ping in 10 seconds, consider connection dead (improved from 30s)
+      // This provides much faster detection of connection issues
+      if (lastPing && now - lastPing > 10000) {
+        console.warn('No ping received for 10 seconds, reconnecting...');
         this.reconnect();
       }
-    }, 15000);
+    }, 5000);
   }
 
   private stopHeartbeat() {
@@ -221,13 +285,19 @@ export class WebSocketService {
     const state = store.getState();
     const attempts = state.websocket.reconnectAttempts;
 
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
-    const delay = Math.min(
+    // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, 30s (max)
+    // Jitter prevents thundering herd problem where many clients reconnect simultaneously
+    const baseDelay = Math.min(
       this.baseReconnectDelay * Math.pow(2, attempts),
       this.maxReconnectDelay
     );
 
-    console.log(`Reconnecting in ${delay}ms (attempt ${attempts + 1})`);
+    // Add random jitter: ±25% of base delay
+    // For example, if baseDelay is 4000ms, jitter will be between 3000ms and 5000ms
+    const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
+    const delay = Math.max(1000, baseDelay + jitter); // Ensure minimum 1 second
+
+    console.log(`Reconnecting in ${Math.round(delay)}ms (attempt ${attempts + 1}, base: ${baseDelay}ms)`);
 
     store.dispatch(incrementReconnectAttempts());
 

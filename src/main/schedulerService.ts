@@ -1,14 +1,14 @@
-import { DatabaseService } from './database';
+import { Services } from './services';
 import { MessengerWebSocketServer } from './websocketServer';
 
 export class SchedulerService {
-  private db: DatabaseService;
+  private services: Services;
   private wsServer: MessengerWebSocketServer;
   private interval?: NodeJS.Timeout;
   private checkIntervalMs: number;
 
-  constructor(db: DatabaseService, wsServer: MessengerWebSocketServer, checkIntervalMs: number = 10000) {
-    this.db = db;
+  constructor(services: Services, wsServer: MessengerWebSocketServer, checkIntervalMs: number = 10000) {
+    this.services = services;
     this.wsServer = wsServer;
     this.checkIntervalMs = checkIntervalMs;
   }
@@ -37,9 +37,9 @@ export class SchedulerService {
   /**
    * Process all messages that are due to be sent
    */
-  private processDueMessages() {
+  private async processDueMessages() {
     try {
-      const dueMessages = this.db.getDueScheduledMessages();
+      const dueMessages = this.services.scheduledMessages.getDueScheduledMessages();
 
       if (dueMessages.length === 0) {
         return;
@@ -49,20 +49,19 @@ export class SchedulerService {
 
       for (const scheduledMsg of dueMessages) {
         try {
-          // Create the actual message
-          const messageId = this.db.createMessage(
-            scheduledMsg.chatId,
-            Date.now(),
-            scheduledMsg.sender,
-            scheduledMsg.body
-          );
+          // Create the actual message using MessageService (automatically encrypts)
+          const message = await this.services.messages.sendMessage({
+            chatId: scheduledMsg.chatId,
+            sender: scheduledMsg.sender,
+            body: scheduledMsg.body,
+            timestamp: Date.now()
+          });
 
           // Mark scheduled message as sent
-          this.db.markScheduledMessageSent(scheduledMsg.id, messageId);
+          this.services.scheduledMessages.markScheduledMessageSent(scheduledMsg.id, message.id);
 
           // Broadcast the new message to all clients
-          const message = this.db.getMessageById(messageId);
-          if (message && this.wsServer) {
+          if (this.wsServer) {
             this.wsServer.broadcastNewMessage({
               id: message.id,
               chatId: message.chatId,
@@ -72,7 +71,7 @@ export class SchedulerService {
             });
           }
 
-          console.log(`Sent scheduled message ${scheduledMsg.id} as message ${messageId}`);
+          console.log(`Sent scheduled message ${scheduledMsg.id} as message ${message.id}`);
         } catch (error) {
           console.error(`Error sending scheduled message ${scheduledMsg.id}:`, error);
         }
